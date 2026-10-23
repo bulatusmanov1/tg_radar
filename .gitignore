@@ -1,0 +1,7 @@
+__pycache__/
+*.db
+result.json
+*/result.json
+ChatExport*/
+stats/
+venv/

@@ -1,682 +1,345 @@
-import argparse
-import shlex
+import importlib
+import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
-import psycopg2
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 import config
 from database import Telegram_DB
-from filters import Importance_Scorer, run_analysis
-from init_db import init_database
-from notifier import Notifier
-from stats import Stats_Plotter
-from tg_import import import_export
-from ui import Terminal_UI
+from filters import Message_Filters
+from tg_import import Telegram_Export_Parser
 
 
-class TG_Radar_App:
-    MENU = [
-        ("1", "digest", "сводка: что важного, дедлайны, вопросы без ответа"),
-        ("2", "inbox", "важные непрочитанные сообщения"),
-        ("3", "deadlines", "ближайшие дедлайны"),
-        ("4", "unanswered", "вопросы ко мне без ответа"),
-        ("5", "mentions", "упоминания и ответы мне"),
-        ("6", "chats", "список чатов"),
-        ("7", "stats", "статистика"),
-        ("8", "import", "импорт экспорта Telegram"),
-        ("9", "analyze", "оценить новые сообщения"),
-    ]
-
+class TG_Radar:
     def __init__(self):
         """
-        Приложение TG Radar: связывает базу, фильтры и вывод в терминал
+        Главный класс: связывает импорт, базу данных и фильтры, выполняет команды из терминала
         """
-        self.ui = Terminal_UI()
-        self.db = None
+        self.db = Telegram_DB(config.DB_PATH)
 
-    def connect(self):
+    def short(self, text, length: int = 90) -> str:
         """
-        Подключение к базе (лениво, при первой команде, которой она нужна)
+        Текст в одну строку, обрезанный до length символов
         """
-        if self.db is None:
-            try:
-                self.db = Telegram_DB(**config.DB_SETTINGS)
-            except psycopg2.OperationalError as e:
-                self.ui.error("Не удалось подключиться к PostgreSQL. Проверьте DB_SETTINGS в config.py")
-                self.ui.error(str(e).strip().splitlines()[0] if str(e).strip() else "нет подробностей")
-                self.ui.info("Если базы ещё нет — запустите: python main.py init")
-                sys.exit(1)
-            if not self.db.tables_exist():
-                self.ui.warn("Таблицы не созданы. Запустите: python main.py init")
-                sys.exit(1)
-        return self.db
+        text = " ".join(str(text or "").split())
+        return text if len(text) <= length else text[:length - 1] + "…"
 
-    def resolve_chat(self, query: str):
+    def parse_day(self, value: str) -> str:
         """
-        Поиск чата по id или части названия. Если подходят несколько — показывает список
+        Дата из ввода пользователя -> "ГГГГ-ММ-ДД".
+        Понимает 22.10, 22.10.2026 и 2026-10-22; год по умолчанию — год последнего сообщения в базе
+        """
+        if "-" in value:
+            return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d")
+        parts = value.split(".")
+        year = int(parts[2]) if len(parts) == 3 else int(self.db.get_last_date()[:4])
+        return datetime(year, int(parts[1]), int(parts[0])).strftime("%Y-%m-%d")
+
+    def print_rows(self, rows, empty_text: str):
+        """
+        Вывод списка сообщений: (id, дата, место, отправитель, текст, баллы)
+        """
+        if not rows:
+            print(empty_text)
+            return
+        for row in rows:
+            ref, date, place, sender, text, score = row[:6]
+            print(f"#{ref:<5} [{score:>2}] {date[:16]}  {self.short(place, 30)} · {self.short(sender, 20)}")
+            print(f"        {self.short(text) or '(без текста)'}")
+
+    def score_messages(self, only_new: bool = True) -> int:
+        """
+        Оценка сообщений фильтрами.
+        only_new=True — только что импортированные (у них ещё нет оценки), заодно сохраняются их дедлайны.
+        only_new=False — пересчёт всех оценок (rescore); дедлайны не трогаются, чтобы не потерять отметки done
         Возвращает:
-            chat_id или None
+            сколько сообщений оценено
         """
-        if query is None:
-            return None
-        found = self.connect().find_chat(query)
-        if not found:
-            self.ui.error(f"Чат «{query}» не найден")
-            return None
-        exact = [row for row in found if str(row[1]).lower() == query.lower()]
-        if len(found) == 1 or len(exact) == 1:
-            return (exact or found)[0][0]
-        self.ui.warn("Подходит несколько чатов, уточните (можно по id):")
-        self.ui.table(["chat_id", "название"], found[:15], "rl")
-        return None
-
-    def cmd_init(self, args):
-        """
-        Создание базы и таблиц
-        """
-        init_database(force=args.force)
+        filters = Message_Filters(self.db.get_my_message_keys())
+        messages = self.db.get_messages_for_scoring(only_new)
+        for msg in messages:
+            verdict = filters.score(msg)
+            self.db.save_score(msg["id"], verdict["score"], verdict["reasons"], verdict["is_question"])
+            if only_new:
+                self.db.insert_deadlines(msg["id"], verdict["deadlines"])
+        self.db.commit()
+        self.db.update_answered()
+        return len(messages)
 
     def cmd_import(self, args):
         """
-        Импорт result.json из Telegram Desktop + сразу оценка важности
+        Импорт result.json: сообщения -> база -> админы -> оценка новых сообщений
         """
-        db = self.connect()
-        path = args.path or config.EXPORT_PATH
-        self.ui.title(f"Импорт: {path}")
+        path = " ".join(args) if args else config.EXPORT_PATH
+        if not os.path.exists(path):
+            print(f"Файл не найден: {path}")
+            return
+        if not config.MY_USER_ID:
+            print("! MY_USER_ID в config.py не задан: не будут работать 'ответ мне' и 'вопросы без ответа'")
+
+        parser = Telegram_Export_Parser(config.MY_USER_ID)
+        for chat_id, name, records, admins in parser.parse(path):
+            added = self.db.insert_messages(records)
+            self.db.mark_admins(chat_id, admins)
+            print(f"  {self.short(name, 40):<40} сообщений: {len(records)}, новых: {added}, админов: {len(admins)}")
+        scored = self.score_messages(only_new=True)
+        print(f"Оценено новых сообщений: {scored}. Сводка за последний день: day")
+
+    def cmd_day(self, args):
+        """
+        Главная команда — сводка за день: где сколько писали, что важного, новые дедлайны, кто ждёт ответа.
+        day — последний день в базе, day 22.10 — конкретный день
+        """
         try:
-            result = import_export(db, path)
-        except FileNotFoundError as e:
-            self.ui.error(str(e))
-            self.ui.info("Telegram Desktop -> Настройки -> Продвинутые -> Экспорт данных, формат JSON")
+            day = self.parse_day(args[0]) if args else self.db.get_last_date()
+        except (ValueError, IndexError):
+            print("Не понял дату. Примеры: day 22.10, day 22.10.2026")
             return
-        self.ui.ok(f"Чатов: {result['chats']}, сообщений: {result['messages']}, новых: {result['new']}")
-        if result["my_id"]:
-            self.ui.info(f"Мой user_id: {result['my_id']}")
-        else:
-            self.ui.warn("Не удалось определить мой user_id — впишите MY_USER_ID в config.py, "
-                         "иначе не будут работать 'ответ мне' и 'вопрос без ответа'")
-        if not args.no_analyze:
-            self.analyze(reanalyze=False, my_user_id=result["my_id"])
-
-    def analyze(self, reanalyze: bool, my_user_id=None):
-        """
-        Запуск оценки важности
-        """
-        self.ui.title("Оценка важности" + (" (заново)" if reanalyze else ""))
-        totals = run_analysis(self.connect(), reanalyze=reanalyze, my_user_id=my_user_id)
-        self.ui.ok(
-            f"critical: {totals['critical']}, high: {totals['high']}, medium: {totals['medium']}, "
-            f"low: {totals['low']}, мои: {totals['mine']}, дат/дедлайнов найдено: {totals['deadlines']}"
-        )
-
-    def cmd_analyze(self, args):
-        """
-        Оценка новых сообщений (или всех заново с --reanalyze после смены весов)
-        """
-        if args.reanalyze:
-            answer = self.ui.ask("Отметки 'прочитано' и 'сделано' будут сброшены. Продолжить? [y/N] ", "n")
-            if answer.lower() not in ("y", "yes", "д", "да"):
-                return
-        self.analyze(args.reanalyze)
-
-    def cmd_inbox(self, args):
-        """
-        Важные непрочитанные сообщения
-        """
-        levels = ["critical", "high"]
-        if args.medium:
-            levels.append("medium")
-        if args.level:
-            levels = [args.level]
-        chat_id = self.resolve_chat(args.chat) if args.chat else None
-        if args.chat and chat_id is None:
+        if day is None:
+            print("База пустая, сначала import")
+            return
+        overview = self.db.get_day_overview(day, config.IMPORTANT_SCORE)
+        total = sum(row[1] for row in overview)
+        print(f"===== Сводка за {datetime.strptime(day, '%Y-%m-%d'):%d.%m.%Y}: {total} сообщений =====")
+        if not overview:
             return
 
-        rows = self.connect().get_inbox(levels, args.limit, args.read, args.days, chat_id)
-        self.ui.title(f"Входящие ({', '.join(levels)})")
-        if not rows:
-            self.ui.ok("Ничего важного непрочитанного 🎉")
+        print("\nГде писали (всего / важных):")
+        for place, count, important in overview:
+            print(f"  {self.short(place, 40):<40} {count:>4} / {important}")
+
+        print("\nВажное:")
+        for ref, date, place, sender, text, score, reasons in self.db.get_important(config.IMPORTANT_SCORE, day, day, limit=10):
+            print(f"#{ref:<5} [{score:>2}] {date[11:16]}  {self.short(place, 30)} · {self.short(sender, 20)}")
+            print(f"        {self.short(text)}")
+            print(f"        почему: {self.short(reasons, 85)}")
+
+        deadlines = self.db.get_deadlines(created_on=day)
+        if deadlines:
+            print("\nНовые даты из сообщений этого дня:")
+            for deadline_id, date, kind, place, text in deadlines:
+                label = "дедлайн" if kind == "deadline" else "событие"
+                print(f"  {date}  {label:<8} {self.short(place, 25):<25} {self.short(text, 55)}")
+
+        unanswered = self.db.get_unanswered(day)
+        if unanswered:
+            print("\nЖдут моего ответа:")
+            self.print_rows(unanswered, "")
+
+    def cmd_important(self, args):
+        """
+        Важные сообщения за последние N дней до последнего сообщения в базе (по умолчанию 7)
+        """
+        days = int(args[0]) if args and args[0].isdigit() else 7
+        last = self.db.get_last_date()
+        if last is None:
+            print("База пустая, сначала import")
             return
-        for ref, chat, sender, date, text, score, level, reasons, is_read, media in rows:
-            self.ui.message_card(ref, chat, sender, date, text, score, level,
-                                 reasons if args.why else None, media, full=args.full)
-        print()
-        self.ui.info("show <id> — подробнее, read <id> [<id>...] — прочитано, read --all — всё прочитано")
+        first = (datetime.strptime(last, "%Y-%m-%d") - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        rows = self.db.get_important(config.IMPORTANT_SCORE, first, last)
+        self.print_rows(rows, f"За {days} дн. важного нет")
 
     def cmd_show(self, args):
         """
-        Подробности сообщения: полный текст, почему оно важное, контекст переписки
+        Сообщение целиком + почему у него такая оценка + найденные даты
         """
-        db = self.connect()
-        details = db.get_message_details(args.id)
-        if details is None:
-            self.ui.error(f"Сообщение #{args.id} не найдено")
+        if not args or not args[0].isdigit():
+            print("Пример: show 12")
             return
-
-        self.ui.title(f"Сообщение #{details['id']}")
-        self.ui.message_card(details["id"], details["chat_name"], details["sender_name"], details["msg_date"],
-                             details["msg_text"], details["score"], details["level"], None,
-                             details["media_type"], full=True)
-        if details["file_name"]:
-            self.ui.info(f"Файл: {details['file_name']}")
-        if details["links"]:
-            self.ui.info("Ссылки: " + ", ".join(details["links"][:5]))
-
-        print()
-        print(self.ui.c("Почему такая оценка:", "bold"))
-        for reason in details["reasons"] or ["ни один фильтр не сработал"]:
-            print("  • " + reason)
-
-        if details["deadlines"]:
-            print(self.ui.c("Даты в сообщении:", "bold"))
-            for date, kind, raw in details["deadlines"]:
-                print(f"  • {date:%d.%m.%Y %H:%M}  [{kind}]  «{raw}»")
-
-        if args.context:
-            print()
-            print(self.ui.c("Контекст:", "bold"))
-            for ref, sender, date, text in db.get_context(args.id, args.context):
-                marker = self.ui.c("→", "yellow") if ref == args.id else " "
-                print(f" {marker} {date:%d.%m %H:%M} {self.ui.short(sender, 18):<18} {self.ui.short(text, self.ui.width() - 34)}")
-
-        if not details["is_read"] and details["level"] not in (None, "mine"):
-            db.mark_read([args.id])
-
-    def cmd_read(self, args):
-        """
-        Пометить прочитанным
-        """
-        db = self.connect()
-        if args.all:
-            count = db.mark_all_read()
-        elif args.ids:
-            count = db.mark_read(args.ids)
-        else:
-            self.ui.warn("Укажите id сообщений или --all")
+        row = self.db.get_message(int(args[0]))
+        if row is None:
+            print("Нет такого сообщения")
             return
-        self.ui.ok(f"Помечено прочитанными: {count}")
-
-    def deadline_color(self, date: datetime) -> str:
-        """
-        Цвет дедлайна по близости
-        """
-        hours = (date - datetime.now()).total_seconds() / 3600
-        if hours < 0:
-            return "gray"
-        if hours <= 24:
-            return "red"
-        if hours <= 72:
-            return "yellow"
-        return "green"
-
-    def human_delta(self, date: datetime) -> str:
-        """
-        "через 2 дн. 5 ч." / "3 ч. назад"
-        """
-        seconds = (date - datetime.now()).total_seconds()
-        future = seconds >= 0
-        seconds = abs(seconds)
-        days, hours = int(seconds // 86400), int(seconds % 86400 // 3600)
-        if days:
-            text = f"{days} дн. {hours} ч."
-        elif hours:
-            text = f"{hours} ч."
-        else:
-            text = f"{int(seconds // 60)} мин."
-        return f"через {text}" if future else f"{text} назад"
+        ref, date, chat, topic, sender, text, score, reasons = row
+        place = f"{chat} / {topic}" if topic else chat
+        print(f"#{ref} {date[:16]}  {place} · {sender}  [{score} баллов]\n")
+        print(text or "(без текста)")
+        print("\nПочему:")
+        for reason in (reasons or "ни один фильтр не сработал").split("; "):
+            print(f"  • {reason}")
+        for deadline_date, kind, raw in self.db.get_message_deadlines(ref):
+            print(f"  📅 {deadline_date} ({kind}): «{raw}»")
 
     def cmd_deadlines(self, args):
         """
-        Дедлайны и события из сообщений
+        Невыполненные дедлайны и события начиная с сегодняшнего дня.
+        По умолчанию — только из важных сообщений, deadlines all — из всех
         """
-        kind = None if args.events else "deadline"
-        rows = self.connect().get_deadlines(args.days, args.all, args.past, kind)
-        self.ui.title("Дедлайны" + (" и события" if args.events else ""))
+        now = datetime.now()
+        min_score = None if "all" in args else config.IMPORTANT_SCORE
+        rows = self.db.get_deadlines(date_from=now.strftime("%Y-%m-%d 00:00"), min_score=min_score)
         if not rows:
-            self.ui.ok("Ближайших дедлайнов не найдено")
-            if not args.past:
-                self.ui.info("Старый экспорт? Попробуйте: deadlines --past")
+            print("Дедлайнов нет")
             return
-        for dl_id, date, kind_value, raw, done, chat, sender, text, ref in rows:
-            status = self.ui.c("✓", "green") if done else self.ui.c("●", self.deadline_color(date))
-            when = self.ui.c(f"{date:%d.%m %H:%M}", self.deadline_color(date))
-            delta = self.ui.c(f"{self.human_delta(date):<17}", "gray")
-            label = self.ui.c(f"{'дедлайн' if kind_value == 'deadline' else 'событие':<8}", "cyan" if kind_value == "event" else "gray")
-            chat_cell = self.ui.c(self.ui.short(chat, 22).ljust(22), "magenta")
-            print(f" {status} {dl_id:>4}  {when}  {delta} {label} {chat_cell}  "
-                  f"{self.ui.short(text, max(20, self.ui.width() - 78))}  {self.ui.c(f'(#{ref})', 'gray')}")
-        print()
-        self.ui.info("done <номер> — отметить выполненным")
+        for deadline_id, date, kind, place, text in rows:
+            days_left = (datetime.strptime(date, "%Y-%m-%d %H:%M") - now).days
+            mark = "🔴" if days_left < 1 else "🟡" if days_left < config.SOON_DAYS else "🟢"
+            label = "дедлайн" if kind == "deadline" else "событие"
+            print(f"{mark} {deadline_id:<4} {date}  {label:<8} {self.short(place, 25):<25} {self.short(text, 60)}")
+        print("Отметить выполненным: done <номер>")
 
     def cmd_done(self, args):
         """
         Отметить дедлайн выполненным
         """
-        if self.connect().mark_deadline_done(args.id, not args.undo):
-            self.ui.ok(f"Дедлайн {args.id}: {'снова активен' if args.undo else 'выполнен'}")
+        if not args or not args[0].isdigit():
+            print("Пример: done 4")
+        elif self.db.mark_deadline_done(int(args[0])):
+            print("Готово ✓")
         else:
-            self.ui.error(f"Дедлайн {args.id} не найден")
-
-    def print_message_rows(self, rows, empty_text: str):
-        """
-        Вывод списка сообщений (id, чат, отправитель, дата, текст, баллы)
-        """
-        if not rows:
-            self.ui.ok(empty_text)
-            return
-        for ref, chat, sender, date, text, score, *rest in rows:
-            self.ui.message_card(ref, chat, sender, date, text, score, rest[0] if rest else None)
+            print("Нет такого дедлайна")
 
     def cmd_unanswered(self, args):
         """
-        Вопросы ко мне, на которые я не ответил
+        Вопросы ко мне без ответа за всё время
         """
-        self.ui.title("Вопросы без ответа")
-        self.print_message_rows(self.connect().get_unanswered(args.limit), "Все вопросы отвечены")
-
-    def cmd_mentions(self, args):
-        """
-        Упоминания и ответы мне
-        """
-        self.ui.title("Упоминания и ответы мне")
-        self.print_message_rows(self.connect().get_mentions(args.limit), "Упоминаний нет")
+        self.print_rows(self.db.get_unanswered(), "Все вопросы отвечены")
 
     def cmd_search(self, args):
         """
-        Поиск по тексту
+        Поиск по тексту сообщений
         """
-        chat_id = self.resolve_chat(args.chat) if args.chat else None
-        if args.chat and chat_id is None:
+        if not args:
+            print("Пример: search экзамен")
             return
-        text = " ".join(args.text)
-        self.ui.title(f"Поиск: {text}")
-        self.print_message_rows(self.connect().search_messages(text, chat_id, args.limit), "Ничего не найдено")
+        self.print_rows(self.db.search(" ".join(args)), "Ничего не найдено")
 
-    def cmd_chats(self, args):
+    def cmd_senders(self, args):
         """
-        Список чатов
+        Самые активные участники с id — чтобы выбрать преподавателей для VIP_SENDERS
         """
-        rows = self.connect().get_chats()
-        if args.filter:
-            rows = [row for row in rows if args.filter.lower() in str(row[1]).lower()]
-        self.ui.title("Чаты")
-        table = []
-        for chat_id, name, chat_type, priority, muted, total, important, last in rows[:args.limit]:
-            flags = ("🔇" if muted else "") + (f"★{priority}" if priority > 0 else (f"↓{priority}" if priority < 0 else ""))
-            table.append([chat_id, name, chat_type, total, important, f"{last:%d.%m.%Y}" if last else "-", flags])
-        self.ui.table(["chat_id", "название", "тип", "сообщ.", "важных", "последнее", ""], table, "rllrrll")
-        print()
-        self.ui.info("mute <чат>, unmute <чат>, priority <чат> <число> — после изменения: analyze --reanalyze")
-
-    def cmd_mute(self, args):
-        """
-        Заглушить / включить чат
-        """
-        chat_id = self.resolve_chat(" ".join(args.chat))
-        if chat_id is not None and self.connect().set_chat_muted(chat_id, not args.unmute):
-            self.ui.ok(f"Чат {chat_id} {'включён' if args.unmute else 'заглушён'}")
-
-    def cmd_priority(self, args):
-        """
-        Приоритет чата
-        """
-        chat_id = self.resolve_chat(" ".join(args.chat))
-        if chat_id is not None and self.connect().set_chat_priority(chat_id, args.value):
-            self.ui.ok(f"Приоритет чата {chat_id}: {args.value}")
-
-    def cmd_rules(self, args):
-        """
-        Пользовательские правила: ключевые слова, VIP-отправители, VIP-чаты
-        """
-        db = self.connect()
-        if args.action == "add":
-            if not args.type or not args.value:
-                self.ui.error("Пример: rules add keyword 'курсов\\w*' --weight 3")
-                return
-            db.add_rule(args.type, " ".join(args.value), args.weight)
-            self.ui.ok("Правило добавлено. Чтобы применить к старым сообщениям: analyze --reanalyze")
-        elif args.action == "remove":
-            if not args.value or not args.value[0].isdigit():
-                self.ui.error("Пример: rules remove 3")
-                return
-            if db.remove_rule(int(args.value[0])):
-                self.ui.ok("Правило удалено")
-            else:
-                self.ui.error("Правило не найдено")
-        self.ui.title("Правила")
-        rows = db.get_rules()
-        if rows:
-            self.ui.table(["id", "тип", "значение", "вес"], rows, "rllr")
-        else:
-            self.ui.info("Своих правил пока нет (базовые — в config.py)")
+        print(f"{'имя':<25} {'id':<16} {'сообщ.':>6} {'важных':>6}")
+        for sender, sender_id, total, important, is_admin in self.db.get_senders(config.IMPORTANT_SCORE):
+            mark = " (админ)" if is_admin else ""
+            print(f"{self.short(sender, 25):<25} {sender_id:<16} {total:>6} {important:>6}{mark}")
 
     def cmd_stats(self, args):
         """
-        Статистика в терминале (+ PNG-графики с --plot)
+        Четыре графика на одной картинке: активность по дням, темы/чаты, участники, часы.
+        Картинка сохраняется в STATS_DIR и сразу открывается
         """
-        db = self.connect()
-        totals = db.get_totals()
-        self.ui.title("Статистика")
-        if totals["first"]:
-            self.ui.info(f"Период: {totals['first']:%d.%m.%Y} — {totals['last']:%d.%m.%Y}")
-        self.ui.info(f"Чатов: {totals['chats']}, сообщений: {totals['messages']} (моих: {totals['mine']})")
+        last = self.db.get_last_date()
+        if last is None:
+            print("База пустая, сначала import")
+            return
+        by_day = self.db.get_activity_by_day(config.IMPORTANT_SCORE, last, config.STATS_DAYS)
+        places = self.db.get_top_places(config.IMPORTANT_SCORE)[::-1]
+        senders = self.db.get_senders(config.IMPORTANT_SCORE, limit=10)[::-1]
+        by_hour = dict(self.db.get_activity_by_hour())
 
-        activity = db.get_activity_by_day(args.days)
-        if activity:
-            print(f"\n  Активность за {args.days} дн.: {self.ui.c(self.ui.sparkline([row[1] for row in activity]), 'cyan')}")
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+        days = [row[0][5:] for row in by_day]
+        ax1.plot(days, [row[1] for row in by_day], marker="o", label="все")
+        ax1.plot(days, [row[2] for row in by_day], marker="o", color="crimson", label="важные")
+        ax1.set_title(f"Сообщения по дням ({config.STATS_DAYS} дн.)")
+        ax1.tick_params(axis="x", rotation=70, labelsize=8)
+        ax1.legend()
 
-        print(self.ui.c("\nУровни важности", "bold"))
-        self.ui.bar_chart(db.get_level_distribution(), "yellow")
+        names = [self.short(row[0], 30) for row in places]
+        ax2.barh(names, [row[1] for row in places], label="все")
+        ax2.barh(names, [row[2] for row in places], color="crimson", label="важные")
+        ax2.set_title("Темы и чаты")
+        ax2.legend()
 
-        print(self.ui.c("\nСамые активные чаты", "bold"))
-        self.ui.bar_chart([(row[0], row[1]) for row in db.get_top_chats(args.limit)])
+        names = [self.short(row[0], 20) for row in senders]
+        ax3.barh(names, [row[2] for row in senders], label="все")
+        ax3.barh(names, [row[3] for row in senders], color="crimson", label="важные")
+        ax3.set_title("Самые активные участники")
+        ax3.legend()
 
-        print(self.ui.c("\nГде больше всего важного", "bold"))
-        self.ui.bar_chart([(row[0], row[2]) for row in db.get_top_chats(args.limit, by="important") if row[2]], "red")
+        ax4.bar(range(24), [by_hour.get(hour, 0) for hour in range(24)])
+        ax4.set_xticks(range(24))
+        ax4.set_title("Активность по часам")
 
-        print(self.ui.c("\nКто пишет больше всех", "bold"))
-        self.ui.bar_chart([(row[0], row[1]) for row in db.get_top_senders(args.limit)], "magenta")
+        os.makedirs(config.STATS_DIR, exist_ok=True)
+        path = os.path.join(config.STATS_DIR, f"stats_{datetime.now():%Y%m%d_%H%M%S}.png")
+        fig.tight_layout()
+        fig.savefig(path, dpi=110)
+        plt.close(fig)
+        print(f"График сохранён: {path}")
+        if hasattr(os, "startfile"):
+            os.startfile(path)
 
-        print(self.ui.c("\nАктивность по часам", "bold"))
-        self.ui.bar_chart([(f"{hour:02d}:00", count) for hour, count in db.get_activity_by_hour()], "blue")
-
-        weekdays = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
-        print(self.ui.c("\nПо дням недели", "bold"))
-        self.ui.bar_chart([(weekdays[dow - 1], count) for dow, count in db.get_activity_by_weekday()], "green")
-
-        print(self.ui.c("\nКакие фильтры срабатывают чаще (для настройки весов)", "bold"))
-        self.ui.bar_chart(db.get_reason_stats(15), "gray")
-
-        response = db.get_response_time_stats(args.limit)
-        if response:
-            print(self.ui.c("\nМоё среднее время ответа в личках, мин", "bold"))
-            self.ui.bar_chart([(row[0], float(row[1])) for row in response], "yellow", value_width=8)
-
-        if args.plot:
-            paths = Stats_Plotter(db, config.STATS_DIR).plot_all(args.days)
-            print()
-            for path in paths:
-                self.ui.ok(f"График: {path}")
-
-    def cmd_digest(self, args):
+    def cmd_rescore(self, args):
         """
-        Сводка: главное за раз
+        Перечитать config.py и пересчитать оценки всех сообщений — без перезапуска программы
         """
-        db = self.connect()
-        totals = db.get_totals()
-        self.ui.title(f"TG Radar · {datetime.now():%d.%m.%Y %H:%M}")
-        print(f"  {self.ui.c(totals['critical'], 'red')} критичных · {self.ui.c(totals['high'], 'yellow')} важных · "
-              f"{self.ui.c(totals['deadlines'], 'cyan')} предстоящих дедлайнов/событий · "
-              f"сообщений в базе: {totals['messages']}")
+        importlib.reload(config)
+        count = self.score_messages(only_new=False)
+        print(f"Пересчитано сообщений: {count}")
 
-        rows = db.get_inbox(["critical", "high"], args.limit)
-        if rows:
-            print(self.ui.c("\nГлавное:", "bold"))
-            for ref, chat, sender, date, text, score, level, reasons, is_read, media in rows:
-                self.ui.message_card(ref, chat, sender, date, text, score, level, None, media)
-
-        deadlines = db.get_deadlines(days=7)
-        if deadlines:
-            print(self.ui.c("\nДедлайны на неделю:", "bold"))
-            for dl_id, date, kind, raw, done, chat, sender, text, ref in deadlines[:args.limit]:
-                print(f"  {self.ui.c(f'{date:%d.%m %H:%M}', self.deadline_color(date))}  "
-                      f"{self.ui.c(self.ui.short(chat, 22).ljust(22), 'magenta')}  {self.ui.short(text, self.ui.width() - 45)}")
-
-        unanswered = db.get_unanswered(args.limit)
-        if unanswered:
-            print(self.ui.c(f"\nЖдут ответа ({len(unanswered)}):", "bold"))
-            for ref, chat, sender, date, text, score in unanswered[:args.limit]:
-                print(f"  #{ref:<6} {self.ui.c(self.ui.short(sender, 20), 'magenta')}: {self.ui.short(text, self.ui.width() - 35)}")
-
-        if not rows and not deadlines and not unanswered:
-            self.ui.ok("Всё спокойно — можно не заходить в телеграм 😌")
-
-    def cmd_test(self, args):
+    def cmd_help(self, args):
         """
-        Проверить оценку на произвольном тексте (без базы)
+        Список команд
         """
-        from filters import Message_Filters
-        text = " ".join(args.text)
-        chat_type = "personal_chat" if args.personal else "private_supergroup"
-        msg = {
-            "id": 0, "chat_id": 0, "message_id": 0, "sender_name": args.sender, "sender_id": "",
-            "msg_date": datetime.now(), "msg_text": text, "reply_to": None, "is_mine": False,
-            "is_pinned": args.pinned, "media_type": None, "file_name": None, "forwarded_from": None,
-            "via_bot": None, "mentions": [w.lower() for w in text.split() if w.startswith("@")],
-            "links": [], "reactions_count": 0,
+        for name, (_, description) in self.get_commands().items():
+            print(f"  {name:<11} {description}")
+
+    def get_commands(self) -> dict:
+        """
+        Команда -> (функция, описание)
+        """
+        return {
+            "import": (self.cmd_import, "import [путь] — загрузить result.json (по умолчанию EXPORT_PATH)"),
+            "day": (self.cmd_day, "day [22.10] — сводка за день (по умолчанию последний день)"),
+            "important": (self.cmd_important, "important [N] — важное за N дней (по умолчанию 7)"),
+            "show": (self.cmd_show, "show <id> — сообщение целиком и почему оно важное"),
+            "deadlines": (self.cmd_deadlines, "ближайшие дедлайны из важных сообщений (deadlines all — из всех)"),
+            "done": (self.cmd_done, "done <номер> — дедлайн выполнен"),
+            "unanswered": (self.cmd_unanswered, "вопросы ко мне без ответа"),
+            "search": (self.cmd_search, "search <текст> — поиск"),
+            "senders": (self.cmd_senders, "самые активные участники с id (для VIP_SENDERS)"),
+            "stats": (self.cmd_stats, "графики статистики"),
+            "rescore": (self.cmd_rescore, "перечитать config.py и пересчитать оценки"),
+            "help": (self.cmd_help, "список команд"),
+            "exit": (None, "выход"),
         }
-        context = {"chat_info": {0: {"name": "тест", "type": chat_type, "priority": 0, "is_muted": False}}}
-        verdict = Importance_Scorer(Message_Filters(config.FILTER_WEIGHTS, context)).score_message(msg)
-        self.ui.title("Тест оценки")
-        print(f"  {self.ui.level_badge(verdict['level'])} баллы: {verdict['score']}")
-        for reason in verdict["reasons"] or ["ни один фильтр не сработал"]:
-            print("  • " + reason)
-        for item in verdict["deadlines"]:
-            print(f"  📅 {item['date']:%d.%m.%Y %H:%M} [{item['kind']}] «{item['raw']}»")
 
-    def cmd_sync(self, args):
+    def run(self):
         """
-        Подтянуть последние сообщения через Telegram API
+        Главный цикл
         """
-        from live import Telegram_Live
-        try:
-            Telegram_Live(self.connect(), self.ui, Notifier()).run_sync(args.dialogs, args.messages)
-        except RuntimeError as e:
-            self.ui.error(str(e))
+        commands = self.get_commands()
+        count, chats, first, last = self.db.get_totals()
+        if count:
+            print(f"В базе {count} сообщений из {chats} чат(ов), с {first[:10]} по {last[:10]}")
+        else:
+            print("База пустая. Загрузите экспорт: import result.json")
+        print("help — список команд, exit — выход\n")
 
-    def cmd_live(self, args):
-        """
-        Слушать новые сообщения и пинать
-        """
-        from live import Telegram_Live
-        try:
-            Telegram_Live(self.connect(), self.ui, Notifier()).run_live()
-        except RuntimeError as e:
-            self.ui.error(str(e))
-
-    def build_parser(self) -> argparse.ArgumentParser:
-        """
-        Описание всех команд
-        """
-        parser = argparse.ArgumentParser(
-            prog="tg_radar",
-            description="TG Radar — находит важное в ваших Telegram-чатах по правилам (без LLM)",
-        )
-        sub = parser.add_subparsers(dest="command")
-
-        p = sub.add_parser("init", help="создать базу и таблицы")
-        p.add_argument("--force", action="store_true", help="не спрашивать подтверждение")
-        p.set_defaults(func=self.cmd_init)
-
-        p = sub.add_parser("import", help="импорт result.json из Telegram Desktop")
-        p.add_argument("path", nargs="?", help="путь к result.json или папке экспорта")
-        p.add_argument("--no-analyze", action="store_true", help="не запускать оценку после импорта")
-        p.set_defaults(func=self.cmd_import)
-
-        p = sub.add_parser("analyze", help="оценить важность новых сообщений")
-        p.add_argument("--reanalyze", action="store_true", help="пересчитать всё заново (после смены весов)")
-        p.set_defaults(func=self.cmd_analyze)
-
-        p = sub.add_parser("inbox", help="важные непрочитанные")
-        p.add_argument("-l", "--limit", type=int, default=15)
-        p.add_argument("--medium", action="store_true", help="показывать и medium")
-        p.add_argument("--level", choices=["critical", "high", "medium", "low"])
-        p.add_argument("--read", action="store_true", help="включая прочитанные")
-        p.add_argument("--days", type=int, help="только за последние N дней")
-        p.add_argument("--chat", help="только один чат (id или часть названия)")
-        p.add_argument("--why", action="store_true", help="показать причины")
-        p.add_argument("--full", action="store_true", help="полный текст")
-        p.set_defaults(func=self.cmd_inbox)
-
-        p = sub.add_parser("show", help="подробности сообщения")
-        p.add_argument("id", type=int)
-        p.add_argument("-c", "--context", type=int, default=3, help="сколько соседних сообщений показать")
-        p.set_defaults(func=self.cmd_show)
-
-        p = sub.add_parser("read", help="пометить прочитанным")
-        p.add_argument("ids", nargs="*", type=int)
-        p.add_argument("--all", action="store_true")
-        p.set_defaults(func=self.cmd_read)
-
-        p = sub.add_parser("deadlines", help="дедлайны")
-        p.add_argument("--days", type=int, help="горизонт в днях")
-        p.add_argument("--all", action="store_true", help="включая выполненные")
-        p.add_argument("--past", action="store_true", help="включая прошедшие")
-        p.add_argument("--events", action="store_true", help="показывать и события (не только дедлайны)")
-        p.set_defaults(func=self.cmd_deadlines)
-
-        p = sub.add_parser("done", help="отметить дедлайн выполненным")
-        p.add_argument("id", type=int)
-        p.add_argument("--undo", action="store_true")
-        p.set_defaults(func=self.cmd_done)
-
-        p = sub.add_parser("unanswered", help="вопросы ко мне без ответа")
-        p.add_argument("-l", "--limit", type=int, default=20)
-        p.set_defaults(func=self.cmd_unanswered)
-
-        p = sub.add_parser("mentions", help="упоминания и ответы мне")
-        p.add_argument("-l", "--limit", type=int, default=20)
-        p.set_defaults(func=self.cmd_mentions)
-
-        p = sub.add_parser("search", help="поиск по тексту")
-        p.add_argument("text", nargs="+")
-        p.add_argument("--chat")
-        p.add_argument("-l", "--limit", type=int, default=20)
-        p.set_defaults(func=self.cmd_search)
-
-        p = sub.add_parser("chats", help="список чатов")
-        p.add_argument("filter", nargs="?")
-        p.add_argument("-l", "--limit", type=int, default=50)
-        p.set_defaults(func=self.cmd_chats)
-
-        p = sub.add_parser("mute", help="заглушить чат")
-        p.add_argument("chat", nargs="+")
-        p.set_defaults(func=self.cmd_mute, unmute=False)
-
-        p = sub.add_parser("unmute", help="включить чат")
-        p.add_argument("chat", nargs="+")
-        p.set_defaults(func=self.cmd_mute, unmute=True)
-
-        p = sub.add_parser("priority", help="приоритет чата (-5..5)")
-        p.add_argument("chat", nargs="+")
-        p.add_argument("value", type=int)
-        p.set_defaults(func=self.cmd_priority)
-
-        p = sub.add_parser("rules", help="свои правила: rules [list|add|remove]")
-        p.add_argument("action", nargs="?", default="list", choices=["list", "add", "remove"])
-        p.add_argument("type", nargs="?", help="keyword / sender / chat (для add) или id (для remove)")
-        p.add_argument("value", nargs="*")
-        p.add_argument("-w", "--weight", type=int, default=2)
-        p.set_defaults(func=self.cmd_rules)
-
-        p = sub.add_parser("stats", help="статистика")
-        p.add_argument("--plot", action="store_true", help="сохранить PNG-графики")
-        p.add_argument("--days", type=int, default=30)
-        p.add_argument("-l", "--limit", type=int, default=10)
-        p.set_defaults(func=self.cmd_stats)
-
-        p = sub.add_parser("digest", help="сводка")
-        p.add_argument("-l", "--limit", type=int, default=7)
-        p.set_defaults(func=self.cmd_digest)
-
-        p = sub.add_parser("test", help="проверить оценку на своём тексте")
-        p.add_argument("text", nargs="+")
-        p.add_argument("--personal", action="store_true", help="как будто это личка")
-        p.add_argument("--pinned", action="store_true")
-        p.add_argument("--sender", default="Тест")
-        p.set_defaults(func=self.cmd_test)
-
-        p = sub.add_parser("sync", help="подтянуть свежие сообщения через Telegram API (telethon)")
-        p.add_argument("--dialogs", type=int, default=50)
-        p.add_argument("--messages", type=int, default=200)
-        p.set_defaults(func=self.cmd_sync)
-
-        p = sub.add_parser("live", help="слушать новые сообщения и пинать (telethon)")
-        p.set_defaults(func=self.cmd_live)
-
-        return parser
-
-    def fix_rules_args(self, args):
-        """
-        Для 'rules remove 3' число попадает в type — переносим его в value
-        """
-        if getattr(args, "func", None) == self.cmd_rules and args.action == "remove" and args.type:
-            args.value = [args.type] + list(args.value)
-        return args
-
-    def run_command(self, argv: list[str]) -> bool:
-        """
-        Выполнение одной команды
-        Возвращает:
-            bool: False, если команду не удалось разобрать
-        """
-        parser = self.build_parser()
-        try:
-            args = parser.parse_args(argv)
-        except SystemExit:
-            return False
-        if not getattr(args, "func", None):
-            parser.print_help()
-            return False
-        self.fix_rules_args(args)
-        try:
-            args.func(args)
-        except psycopg2.Error as e:
-            self.ui.error(f"Ошибка базы данных: {e}")
-        return True
-
-    def interactive(self):
-        """
-        Интерактивный режим: меню с цифрами + можно вводить любые команды как в CLI
-        """
-        self.ui.title("TG Radar")
-        print("  Цифра — пункт меню, или любая команда: inbox --why, show 42, search экзамен, help, q — выход")
         while True:
-            print()
-            for key, command, label in self.MENU:
-                print(f"  {self.ui.c(key, 'cyan')} {command:<11} {self.ui.c(label, 'gray')}")
-            line = self.ui.ask("\ntg_radar> ")
-            if line.lower() in ("q", "quit", "exit", "выход"):
+            try:
+                line = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
                 break
             if not line:
                 continue
-            if line in ("help", "h", "?"):
-                self.build_parser().print_help()
+            name, *args = line.split()
+            if name == "exit":
+                break
+            if name not in commands:
+                print("Неизвестная команда, help — список команд")
                 continue
-            for key, command, _ in self.MENU:
-                if line == key:
-                    line = command
-                    break
             try:
-                argv = shlex.split(line)
-            except ValueError as e:
-                self.ui.error(f"Не разобрал команду: {e}")
-                continue
-            self.run_command(argv)
-
-    def close(self):
-        """
-        Закрытие соединения
-        """
-        if self.db is not None:
-            self.db.close()
+                commands[name][0](args)
+            except Exception as e:
+                print(f"! Ошибка: {e}")
+            print()
 
 
 def main():
-    """
-    Точка входа: без аргументов — интерактивный режим, с аргументами — одна команда
-    """
-    app = TG_Radar_App()
+    app = TG_Radar()
+    if not app.db.tables_exist():
+        print(f"В {config.DB_PATH} нет таблиц. Сначала выполните: python init_db.py")
+        sys.exit(1)
     try:
-        if len(sys.argv) > 1:
-            app.run_command(sys.argv[1:])
-        else:
-            app.interactive()
-    except KeyboardInterrupt:
-        print()
+        app.run()
     finally:
-        app.close()
+        app.db.close()
 
 
 if __name__ == "__main__":

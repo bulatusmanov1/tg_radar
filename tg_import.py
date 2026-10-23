@@ -1,228 +1,160 @@
 import json
 import os
-from datetime import datetime
 
 import config
 
 
 class Telegram_Export_Parser:
-    def __init__(self, my_user_id=None, skip_chat_types=None):
+    ADMIN_ACTIONS = {"topic_created", "topic_edit", "pin_message"}
+
+    def __init__(self, my_user_id):
         """
-        Парсер экспорта Telegram Desktop (формат JSON: result.json)
-        Поддерживает и полный экспорт (Settings -> Advanced -> Export Telegram data),
-        и экспорт одного чата (меню чата -> Export chat history)
+        Разбор экспорта Telegram Desktop в формате JSON (result.json).
+        Поддерживается экспорт одного чата и полный экспорт аккаунта
         """
-        self.my_user_id = my_user_id
-        self.skip_chat_types = set(skip_chat_types or [])
+        self.my_id = f"user{my_user_id}" if my_user_id else None
 
     def load(self, path: str) -> dict:
         """
-        Чтение JSON-файла экспорта
-        Можно передать путь к папке экспорта — внутри будет найден result.json
+        Чтение файла экспорта. Можно передать путь к папке — внутри будет найден result.json
         """
         if os.path.isdir(path):
             path = os.path.join(path, "result.json")
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Файл экспорта не найден: {path}")
         with open(path, encoding="utf-8") as file:
             return json.load(file)
 
-    def detect_my_id(self, data: dict):
+    def get_chats(self, data: dict) -> list[dict]:
         """
-        Определение моего user_id: из config, из personal_information или из Избранного
+        Список чатов для импорта.
+        Экспорт одного чата — это сам чат. В полном экспорте берутся личные чаты (если WATCH_ALL_PERSONAL)
+        и группы из WATCH_CHATS (пустой список = все группы)
         """
-        if self.my_user_id:
-            return self.my_user_id
-        personal = data.get("personal_information") or {}
-        if personal.get("user_id"):
-            self.my_user_id = personal["user_id"]
-            return self.my_user_id
-        for chat in self.get_chat_list(data):
-            if chat.get("type") == "saved_messages":
-                for msg in chat.get("messages", []):
-                    from_id = msg.get("from_id", "")
-                    if from_id.startswith("user"):
-                        self.my_user_id = int(from_id[4:])
-                        return self.my_user_id
-        return None
-
-    def get_chat_list(self, data: dict) -> list[dict]:
-        """
-        Список чатов из экспорта (полный экспорт или один чат)
-        """
-        if "chats" in data:
-            chats = data["chats"].get("list", [])
-            left = data.get("left_chats", {}).get("list", [])
-            return chats + left
         if "messages" in data:
             return [data]
-        return []
+
+        chats = []
+        for chat in data.get("chats", {}).get("list", []):
+            name = (chat.get("name") or "").lower()
+            if chat.get("type") == "personal_chat":
+                if config.WATCH_ALL_PERSONAL:
+                    chats.append(chat)
+            elif chat.get("type") != "saved_messages":
+                if not config.WATCH_CHATS or any(watch.lower() in name for watch in config.WATCH_CHATS):
+                    chats.append(chat)
+        return chats
 
     def flatten_text(self, text) -> str:
         """
-        Текст в экспорте бывает строкой или списком кусков (строки + словари с форматированием)
-        Функция склеивает всё в одну строку
+        Текст в экспорте — строка или список кусков (строки и словари с форматированием).
+        Склеиваем всё в одну строку
         """
         if isinstance(text, str):
             return text
-        if isinstance(text, list):
-            parts = []
-            for part in text:
-                if isinstance(part, str):
-                    parts.append(part)
-                elif isinstance(part, dict):
-                    parts.append(part.get("text", ""))
-            return "".join(parts)
-        return ""
+        return "".join(part if isinstance(part, str) else part.get("text", "") for part in text)
 
-    def extract_entities(self, msg: dict) -> tuple[list, list]:
+    def find_topics(self, messages: list[dict]) -> dict:
         """
-        Вытаскивание упоминаний и ссылок из разметки сообщения
-        Возвращает:
-            (mentions, links): упоминания вида '@username' / 'user:123' и список URL
+        Темы форума: id служебного сообщения "тема создана" -> название темы.
+        Если тему переименовали (topic_edit с новым title), берётся новое название
         """
-        entities = msg.get("text_entities")
-        if entities is None and isinstance(msg.get("text"), list):
-            entities = [part for part in msg["text"] if isinstance(part, dict)]
+        topics = {}
+        for msg in messages:
+            if msg.get("action") == "topic_created":
+                topics[msg["id"]] = msg.get("title")
+            elif msg.get("action") == "topic_edit" and msg.get("title") and msg.get("reply_to_message_id") in topics:
+                topics[msg["reply_to_message_id"]] = msg["title"]
+        return topics
 
-        mentions, links = [], []
-        for entity in entities or []:
-            entity_type = entity.get("type")
-            if entity_type == "mention":
-                mentions.append(entity.get("text", "").lower())
-            elif entity_type == "mention_name":
-                if entity.get("user_id"):
-                    mentions.append(f"user:{entity['user_id']}")
-                mentions.append(entity.get("text", "").lower())
-            elif entity_type == "link":
-                links.append(entity.get("text", ""))
-            elif entity_type == "text_link":
-                links.append(entity.get("href", entity.get("text", "")))
-        return mentions, links
+    def find_admins(self, messages: list[dict]) -> set:
+        """
+        Админы чата: те, кто создавал/менял темы или закреплял сообщения (обычным участникам это недоступно)
+        """
+        return {msg["actor_id"] for msg in messages if msg.get("action") in self.ADMIN_ACTIONS and msg.get("actor_id")}
 
-    def detect_media(self, msg: dict) -> tuple:
+    def find_pinned(self, messages: list[dict]) -> set:
         """
-        Тип вложения и имя файла
-        Возвращает:
-            (media_type, file_name), например ('photo', None) или ('file', 'lab3.pdf')
+        id закреплённых сообщений (по служебным сообщениям "закрепил сообщение")
         """
+        return {msg["message_id"] for msg in messages if msg.get("action") == "pin_message"}
+
+    def get_topic(self, message_id: int, reply_to: dict, topics: dict, cache: dict):
+        """
+        Определение темы сообщения по цепочке ответов.
+        В форуме каждое сообщение — ответ либо на "тема создана", либо на другое сообщение этой же темы.
+        Идём вверх по цепочке, пока не дойдём до темы. Найденные темы запоминаются в cache,
+        поэтому каждая цепочка проходится один раз
+        """
+        path = []
+        current = message_id
+        topic = "Общая тема"
+        while current is not None:
+            if current in topics:
+                topic = topics[current]
+                break
+            if current in cache:
+                topic = cache[current]
+                break
+            path.append(current)
+            current = reply_to.get(current)
+        for visited in path:
+            cache[visited] = topic
+        return topic
+
+    def detect_media(self, msg: dict):
+        """
+        Вложение, по которому сообщение может оказаться шумом: стикер, фото, гифка, кружок
+        """
+        if msg.get("media_type") in ("sticker", "animation", "video_message"):
+            return msg["media_type"]
         if "photo" in msg:
-            return "photo", None
-        if msg.get("media_type"):
-            return msg["media_type"], msg.get("file_name")
-        if "file" in msg:
-            file_name = msg.get("file_name") or os.path.basename(str(msg.get("file", "")))
-            return "file", file_name
-        if "poll" in msg:
-            return "poll", None
-        if "location_information" in msg:
-            return "location", None
-        if "contact_information" in msg:
-            return "contact", None
-        return None, None
+            return "photo"
+        return None
 
-    def count_reactions(self, msg: dict) -> int:
+    def parse_chat(self, chat: dict) -> tuple[list[dict], set]:
         """
-        Суммарное количество реакций на сообщение (есть в новых версиях экспорта)
+        Разбор одного чата
+        Возвращает:
+            (список сообщений в формате базы данных, множество id админов)
         """
-        return sum(int(r.get("count", 0)) for r in msg.get("reactions", []) or [])
+        messages = chat.get("messages", [])
+        topics = self.find_topics(messages)
+        admins = self.find_admins(messages)
+        pinned = self.find_pinned(messages)
+        reply_to = {msg["id"]: msg.get("reply_to_message_id") for msg in messages}
+        cache = {}
 
-    def parse_message(self, msg: dict, chat_id: int) -> dict:
-        """
-        Перевод одного сообщения из формата экспорта в формат базы данных
-        """
-        from_id = msg.get("from_id") or msg.get("actor_id") or ""
-        is_mine = bool(self.my_user_id) and from_id == f"user{self.my_user_id}"
-        mentions, links = self.extract_entities(msg)
-        media_type, file_name = self.detect_media(msg)
-        msg_date = datetime.fromisoformat(msg["date"])
-
-        text = self.flatten_text(msg.get("text", ""))
-        if not text and msg.get("sticker_emoji"):
-            text = msg["sticker_emoji"]
-        if msg.get("poll"):
-            poll = msg["poll"]
-            answers = "; ".join(a.get("text", "") for a in poll.get("answers", []))
-            text = f"{text}\n[Опрос] {poll.get('question', '')}: {answers}".strip()
-
-        return {
-            "chat_id": chat_id,
-            "message_id": msg["id"],
-            "sender_name": msg.get("from") or msg.get("author") or "Без имени",
-            "sender_id": from_id,
-            "msg_date": msg_date,
-            "msg_text": text,
-            "reply_to": msg.get("reply_to_message_id"),
-            "is_mine": is_mine,
-            "is_pinned": False,
-            "media_type": media_type,
-            "file_name": file_name,
-            "forwarded_from": msg.get("forwarded_from"),
-            "via_bot": msg.get("via_bot"),
-            "mentions": mentions,
-            "links": links,
-            "reactions_count": self.count_reactions(msg),
-        }
-
-    def parse_chat(self, chat: dict) -> tuple[dict, list[dict]]:
-        """
-        Разбор одного чата: информация о чате + список сообщений
-        Служебные сообщения (вступил, вышел...) пропускаются,
-        но "закрепил сообщение" используется, чтобы пометить закреплённые
-        """
-        chat_info = {
-            "chat_id": chat.get("id"),
-            "chat_name": chat.get("name") or ("Избранное" if chat.get("type") == "saved_messages" else "Без названия"),
-            "chat_type": chat.get("type", "unknown"),
-        }
-
-        pinned_ids = set()
-        messages = []
-        for msg in chat.get("messages", []):
-            if msg.get("type") == "service":
-                if msg.get("action") == "pin_message" and msg.get("message_id"):
-                    pinned_ids.add(msg["message_id"])
-                continue
+        records = []
+        for msg in messages:
             if msg.get("type") != "message":
                 continue
-            messages.append(self.parse_message(msg, chat_info["chat_id"]))
+            from_id = msg.get("from_id") or ""
+            records.append({
+                "chat_id": chat["id"],
+                "chat_name": chat.get("name") or "Без названия",
+                "chat_type": chat.get("type"),
+                "topic": self.get_topic(msg["id"], reply_to, topics, cache) if topics else None,
+                "message_id": msg["id"],
+                "sender": msg.get("from") or "Без имени",
+                "sender_id": from_id,
+                "date": msg["date"].replace("T", " "),
+                "text": self.flatten_text(msg.get("text", "")),
+                "reply_to": msg.get("reply_to_message_id"),
+                "media": self.detect_media(msg),
+                "is_mine": int(from_id == self.my_id),
+                "is_admin": int(from_id in admins),
+                "is_pinned": int(msg["id"] in pinned),
+            })
+        return records, admins
 
-        for message in messages:
-            if message["message_id"] in pinned_ids:
-                message["is_pinned"] = True
-        return chat_info, messages
-
-    def iter_chats(self, data: dict):
+    def parse(self, path: str):
         """
-        Генератор по всем чатам экспорта (с учётом SKIP_CHAT_TYPES)
+        Главная функция: разбирает весь файл экспорта
+        Возвращает:
+            список (chat_id, название, сообщения, админы) по каждому чату
         """
-        self.detect_my_id(data)
-        for chat in self.get_chat_list(data):
-            if chat.get("type") in self.skip_chat_types:
-                continue
-            if chat.get("id") is None:
-                continue
-            yield self.parse_chat(chat)
-
-
-def import_export(db, path: str, verbose: bool = True) -> dict:
-    """
-    Импорт экспорта Telegram в базу данных
-    Возвращает:
-        dict: статистика импорта (чатов, сообщений всего, новых, мой id)
-    """
-    parser = Telegram_Export_Parser(config.MY_USER_ID, config.SKIP_CHAT_TYPES)
-    data = parser.load(path)
-    my_id = parser.detect_my_id(data)
-
-    result = {"chats": 0, "messages": 0, "new": 0, "my_id": my_id}
-    for chat_info, messages in parser.iter_chats(data):
-        db.insert_chat(chat_info["chat_id"], chat_info["chat_name"], chat_info["chat_type"])
-        new_count = db.insert_messages(messages)
-        db.set_pinned(chat_info["chat_id"], [m["message_id"] for m in messages if m["is_pinned"]])
-        result["chats"] += 1
-        result["messages"] += len(messages)
-        result["new"] += new_count
-        if verbose:
-            print(f"  {chat_info['chat_name'][:40]:<40} {len(messages):>7} сообщ. (+{new_count} новых)")
-    return result
+        data = self.load(path)
+        result = []
+        for chat in self.get_chats(data):
+            records, admins = self.parse_chat(chat)
+            result.append((chat["id"], chat.get("name") or "Без названия", records, admins))
+        return result

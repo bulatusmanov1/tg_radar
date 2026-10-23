@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import config
 
 
-class Deadline_Extractor:
+class Date_Parser:
     MONTHS = {
         "янв": 1, "фев": 2, "мар": 3, "апр": 4, "мая": 5, "май": 5, "июн": 6,
         "июл": 7, "авг": 8, "сен": 9, "окт": 10, "ноя": 11, "дек": 12,
@@ -16,7 +16,7 @@ class Deadline_Extractor:
 
     RE_ISO = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
     RE_NUMERIC = re.compile(
-        r"(?<![\d.,:/])(\d{1,2})\.(\d{1,2})(?:\.(\d{4}|\d{2}))?(?!\d|[./]\d)"
+        r"(?<![\d.,:/])(\d{1,2})\.(\d{2})(?:\.(\d{4}|\d{2}))?(?!\d|[./]\d)"
         r"(?!\s*(?:%|₽|\$|руб|р\.|кг|км|млн|тыс|балл|час|мин|раз|k\b|к\b))"
     )
     RE_SLASH = re.compile(r"(?<![\d.,:/])(\d{1,2})/(\d{1,2})/(\d{4}|\d{2})(?![\d/])")
@@ -39,12 +39,13 @@ class Deadline_Extractor:
 
     RE_DEADLINE_WORDS = re.compile(
         r"\b(дедлайн\w*|deadline|due|срок\w*|сдать|сдач\w*|сда[её]м|сда[её]т|загруз\w*|отправ\w*|"
-        r"присла\w*|успе\w*|крайн\w*|до|не позднее|включительно|дз|домашк\w*|лаб\w*)\b",
+        r"присла\w*|успе\w*|крайн\w*|не позднее|включительно|дз|домашн\w*|домашк\w*|лаб\w*)\b",
         re.IGNORECASE
     )
+    RE_WEAK_DEADLINE = re.compile(r"\bдо\b", re.IGNORECASE)
     RE_EVENT_WORDS = re.compile(
         r"\b(экзамен\w*|зач[её]т\w*|контрольн\w*|коллоквиум\w*|пар[аыу]|лекци\w*|семинар\w*|встреч\w*|"
-        r"созвон\w*|собрани\w*|консультаци\w*|защит\w*|вебинар\w*|пересдач\w*|дз|домашк\w*|лаб\w*)\b",
+        r"созвон\w*|собрани\w*|консультаци\w*|защит\w*|вебинар\w*|пересдач\w*)\b",
         re.IGNORECASE
     )
 
@@ -87,12 +88,20 @@ class Deadline_Extractor:
 
     def _find_time(self, text: str):
         """
-        Поиск времени (18:00, до 23.59) в тексте
+        Поиск времени (18:00, до 23.59) в тексте.
+        Время через точку берётся, только если после точки не может стоять месяц (00 или больше 12):
+        "в 18.30" — время, а "с 21.12" — дата
         Возвращает:
             (часы, минуты, текст_без_времени) или (None, None, текст)
         """
-        match = self.RE_TIME.search(text) or self.RE_TIME_DOT.search(text)
-        if not match:
+        match = self.RE_TIME.search(text)
+        if match is None:
+            for candidate in self.RE_TIME_DOT.finditer(text):
+                minutes = int(candidate.group(2))
+                if minutes == 0 or minutes > 12:
+                    match = candidate
+                    break
+        if match is None:
             return None, None, text
         cleaned = text[:match.start()] + " " + text[match.end():]
         return int(match.group(1)), int(match.group(2)), cleaned
@@ -100,7 +109,9 @@ class Deadline_Extractor:
     def find_absolute_dates(self, text: str, base: datetime) -> list[tuple]:
         """
         Абсолютные даты: 2026-10-25, 25.10, 25.10.2026, 25/10/2026, 25 октября
-        Формат 25/10 без года не берётся — слишком часто это оценка (8/10), а не дата
+        Формат 25/10 без года не берётся — слишком часто это оценка (8/10), а не дата.
+        Месяц в формате 25.10 — только две цифры, а дата без года — не дальше 120 дней вперёд:
+        иначе дробные числа вроде "2.2 балла" или "1.04" превращаются в даты
         Возвращает:
             список (datetime, исходный_фрагмент)
         """
@@ -118,7 +129,7 @@ class Deadline_Extractor:
                     date = self._build_date(day, month, match.group(3), base)
                     if date is None:
                         continue
-                    if match.group(3) is None and date - base > timedelta(days=180):
+                    if match.group(3) is None and date - base > timedelta(days=120):
                         continue
                     found.append((date, match.group(0)))
 
@@ -186,14 +197,16 @@ class Deadline_Extractor:
         Возвращает:
             список словарей {date, kind, raw}, kind = 'deadline' или 'event'
         Относительные даты ("завтра") берутся только если рядом есть слова дедлайна/события,
-        иначе "увидимся завтра" превращалось бы в дедлайн
+        иначе "увидимся завтра" превращалось бы в дедлайн.
+        Вид: 'deadline', если есть сильное слово (сдать, дедлайн, срок) или "до" без слов-событий; иначе 'event'.
+        Даты раньше дня сообщения пропускаются: "сдавал 13.10" — это ссылка на прошлое, а не дедлайн
         """
         if not text or base is None:
             return []
 
         hour, minute, text_wo_time = self._find_time(text)
-        is_deadline = self.is_deadline_text(text)
         is_event = self.is_event_text(text)
+        is_deadline = self.is_deadline_text(text) or (bool(self.RE_WEAK_DEADLINE.search(text)) and not is_event)
 
         found = self.find_absolute_dates(text_wo_time, base)
         if is_deadline or is_event:
@@ -205,8 +218,11 @@ class Deadline_Extractor:
             return []
 
         kind = "deadline" if is_deadline else "event"
+        message_day = datetime(base.year, base.month, base.day)
         result, seen = [], set()
         for date, raw in found:
+            if date < message_day:
+                continue
             if hour is not None:
                 date = date.replace(hour=hour, minute=minute)
             else:
@@ -219,567 +235,205 @@ class Deadline_Extractor:
         return sorted(result, key=lambda item: item["date"])
 
 
+
 class Message_Filters:
+    FILTERS = [
+        "mention_me", "name_in_text", "reply_to_me", "personal_chat", "vip_sender", "keywords",
+        "deadline", "deadline_soon", "question_to_me", "announcement", "topic", "noise",
+    ]
+
     RE_QUESTION_START = re.compile(
-        r"^\s*(кто|что|когда|где|куда|как|почему|зачем|сколько|какой|какая|какие|можешь|можно|сможешь|"
-        r"подскажи|скажи|знаешь|есть ли|будешь|ты\s+\w+\s+\?)",
-        re.IGNORECASE
-    )
-    RE_URGENCY = re.compile(r"!{2,}|‼|❗|🔥|🚨|⚠|⛔|\bsos\b", re.IGNORECASE)
-    RE_MASS_MENTION = re.compile(
-        r"@all\b|@everyone\b|@here\b|@channel\b|\bвсем внимание|\bвнимание,? всем|\bвсем срочно|\bвсе сюда|\bвнимание,? группа",
+        r"^\s*(кто|что|когда|где|куда|как|почему|зачем|сколько|какой|какая|какие|"
+        r"можешь|можно|сможешь|подскажи|скажи|знаешь|есть ли|будешь)\b",
         re.IGNORECASE
     )
     RE_ANNOUNCEMENT = re.compile(
-        r"#важно|#объявлени|#announcement|#дедлайн|\bвнимание\b|\bобъявлени\w*|\bнапоминаю\b|\bнапоминание\b|"
-        r"\bинформаци[яю] для\b|\bуважаемые\b|\bколлеги\b",
+        r"@all\b|@everyone\b|#важно|#объявлени\w*|\bвнимание\b|\bобъявлени\w*|"
+        r"\bнапоминаю\b|\bнапоминание\b|\bуважаемые\b|\bколлеги\b",
         re.IGNORECASE
     )
-    RE_SCHEDULE_CHANGE = re.compile(
-        r"\bперенос\w*|\bперенес\w*|\bотмен\w*|\bвместо\b|\bаудитори\w*|\bауд\.|\bне будет\b|\bзамен[аеуы]\b|\bпереезжа\w*",
-        re.IGNORECASE
-    )
-    RE_MONEY = re.compile(
-        r"\bоплат\w*|\bзаплат\w*|\bперевед\w*|\bперевест\w*|\bдолг\w*|\bскинуться|\bскидываемся|"
-        r"\d+\s?(?:₽|руб\w*|р\.)|\bвзнос\w*",
-        re.IGNORECASE
-    )
-    RE_TIME = re.compile(r"(?<![\d.:])([01]?\d|2[0-3]):([0-5]\d)(?!\d)")
-    RE_LAUGH = re.compile(r"^(?:а?х[аеи]+|ха+|ах+|лол|кек|ору|xd|ахах\w*|хах\w*|[)(]+|\.+)$", re.IGNORECASE)
     RE_HAS_WORD = re.compile(r"[a-zа-яё0-9]", re.IGNORECASE)
+    RE_LAUGH = re.compile(r"^(а?х[аеи]+|ха+|ах+|ору|xd|[)(]+|\.+)$", re.IGNORECASE)
 
-    IMPORTANT_DOMAINS = (
-        "docs.google", "forms.gle", "forms.yandex", "disk.yandex", "drive.google", "lms.", "anytask",
-        "contest.", "wiki.", "zoom.us", "meet.google", "telemost", "teams.microsoft", "notion.", "github.com",
-        "classroom.google", "edu.", "smartlms",
-    )
-    DOCUMENT_EXTENSIONS = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".zip", ".rar", ".ipynb", ".py", ".txt", ".csv")
-    MEDIA_NOISE = ("sticker", "animation", "video_message")
-
-    def __init__(self, weights: dict = None, context: dict = None):
+    def __init__(self, my_keys: set):
         """
-        Набор фильтров важности. Каждый фильтр получает сообщение (dict)
+        Фильтры важности. Каждый фильтр — метод, который получает сообщение (dict)
         и возвращает (баллы, причина) или None, если не сработал.
-        Параметры:
-            weights: веса фильтров (по умолчанию config.FILTER_WEIGHTS)
-            context: данные из БД, нужные некоторым фильтрам:
-                chat_info — chat_id -> {name, type, priority, is_muted}
-                my_keys — множество (chat_id, message_id) моих сообщений
-                reply_counts — (chat_id, message_id) -> сколько ответов
-                last_my_dates — chat_id -> дата моего последнего сообщения
-                rules — пользовательские правила из таблицы rules
-                now — "текущий момент" (для дедлайнов и старых сообщений)
+        Все настройки берутся из config.py в момент создания объекта.
+        my_keys — множество (chat_id, message_id) моих сообщений, нужно фильтру reply_to_me
         """
-        self.weights = dict(config.FILTER_WEIGHTS if weights is None else weights)
-        context = context or {}
-        self.chat_info = context.get("chat_info", {})
-        self.my_keys = context.get("my_keys", set())
-        self.reply_counts = context.get("reply_counts", {})
-        self.last_my_dates = context.get("last_my_dates", {})
-        self.now = context.get("now") or datetime.now()
+        self.my_keys = my_keys
+        self.parser = Date_Parser()
+        self.weights = config.WEIGHTS
+        self.my_username = config.MY_USERNAME.lower()
 
-        self.my_user_id = context.get("my_user_id", config.MY_USER_ID)
-        self.my_username = (config.MY_USERNAME or "").lower()
-        if self.my_username and not self.my_username.startswith("@"):
-            self.my_username = "@" + self.my_username
-        self.re_my_names = None
-        if config.MY_NAMES:
-            names = "|".join(re.escape(name.lower()) for name in config.MY_NAMES)
-            self.re_my_names = re.compile(rf"(?<![\w@])({names})\w*", re.IGNORECASE)
+        names = "|".join(re.escape(name.lower()) for name in config.MY_NAMES)
+        self.re_my_names = re.compile(rf"(?<![\w@])({names})\w*", re.IGNORECASE) if names else None
 
         self.keyword_patterns = [(re.compile(pattern, re.IGNORECASE), weight) for pattern, weight in config.KEYWORDS.items()]
-        self.vip_senders = [(name.lower(), None) for name in config.VIP_SENDERS]
-        self.vip_chats = [(name.lower(), None) for name in config.VIP_CHATS]
+        self.vip_senders = [str(vip).lower() for vip in config.VIP_SENDERS]
         self.noise_words = set(word.lower() for word in config.NOISE_WORDS)
-
-        for rule_id, rule_type, value, weight in context.get("rules", []):
-            if rule_type == "keyword":
-                self.keyword_patterns.append((re.compile(value, re.IGNORECASE), weight))
-            elif rule_type == "sender":
-                self.vip_senders.append((value.lower(), weight))
-            elif rule_type == "chat":
-                self.vip_chats.append((value.lower(), weight))
-
-    def w(self, name: str) -> int:
-        """
-        Вес фильтра (0, если фильтра нет в конфиге)
-        """
-        return self.weights.get(name, 0)
-
-    def _chat(self, msg: dict) -> dict:
-        """
-        Информация о чате сообщения
-        """
-        return self.chat_info.get(msg["chat_id"], {})
-
-    def _text(self, msg: dict) -> str:
-        """
-        Текст сообщения (пустая строка, если текста нет)
-        """
-        return msg.get("msg_text") or ""
-
-    def _short(self, value: str, length: int = 30) -> str:
-        """
-        Обрезка строки для вывода в причинах
-        """
-        value = value.replace("\n", " ").strip()
-        return value if len(value) <= length else value[:length - 1] + "…"
-
-    def is_personal(self, msg: dict) -> bool:
-        """
-        Сообщение из личного чата (не с ботом)
-        """
-        return self._chat(msg).get("type") == "personal_chat"
 
     def is_question(self, msg: dict) -> bool:
         """
-        Похоже ли сообщение на вопрос
+        Похоже ли сообщение на вопрос: есть "?" или начинается с вопросительного слова
         """
-        text = self._text(msg)
-        return "?" in text or bool(self.RE_QUESTION_START.search(text))
-
-    def is_mentioning_me(self, msg: dict) -> bool:
-        """
-        Упомянут ли я через @username или mention_name
-        """
-        mentions = msg.get("mentions") or []
-        if self.my_username and self.my_username != "@your_username":
-            if self.my_username in mentions or self.my_username in self._text(msg).lower():
-                return True
-        if self.my_user_id and f"user:{self.my_user_id}" in mentions:
-            return True
-        return False
-
-    def is_reply_to_me(self, msg: dict) -> bool:
-        """
-        Является ли сообщение ответом на моё сообщение
-        """
-        return msg.get("reply_to") is not None and (msg["chat_id"], msg["reply_to"]) in self.my_keys
+        return "?" in msg["text"] or bool(self.RE_QUESTION_START.search(msg["text"]))
 
     def is_addressed_to_me(self, msg: dict) -> bool:
         """
-        Обращено ли сообщение лично ко мне: личка, упоминание, ответ мне или имя в тексте
+        Обращено ли сообщение лично ко мне: личка, упоминание, имя в тексте или ответ на моё сообщение
         """
-        return (
-            self.is_personal(msg)
-            or self.is_mentioning_me(msg)
-            or self.is_reply_to_me(msg)
-            or (self.re_my_names is not None and bool(self.re_my_names.search(self._text(msg))))
-        )
+        return any(check(msg) is not None for check in (
+            self.personal_chat, self.mention_me, self.name_in_text, self.reply_to_me
+        ))
 
     def mention_me(self, msg: dict):
         """
-        Меня упомянули через @username
+        1. Меня упомянули через @username
         """
-        if self.is_mentioning_me(msg):
-            return self.w("mention_me"), f"упоминание: {self.my_username}"
+        if self.my_username in msg["text"].lower():
+            return self.weights["mention_me"], f"упоминание {config.MY_USERNAME}"
         return None
 
     def name_in_text(self, msg: dict):
         """
-        Меня назвали по имени (Булат, Булату, Bulat...)
+        2. Меня назвали по имени (корни имён из MY_NAMES)
         """
         if self.re_my_names is None:
             return None
-        match = self.re_my_names.search(self._text(msg))
+        match = self.re_my_names.search(msg["text"])
         if match:
-            return self.w("name_in_text"), f"обращение по имени: {match.group(0)}"
+            return self.weights["name_in_text"], f"обращение по имени: {match.group(0)}"
         return None
 
     def reply_to_me(self, msg: dict):
         """
-        Ответ на моё сообщение
+        3. Ответ на моё сообщение
         """
-        if self.is_reply_to_me(msg):
-            return self.w("reply_to_me"), "ответ на моё сообщение"
+        if (msg["chat_id"], msg["reply_to"]) in self.my_keys:
+            return self.weights["reply_to_me"], "ответ на моё сообщение"
         return None
 
     def personal_chat(self, msg: dict):
         """
-        Сообщение в личке
+        4. Сообщение в личке
         """
-        if self.is_personal(msg):
-            return self.w("personal_chat"), "личный чат"
-        return None
-
-    def question_to_me(self, msg: dict):
-        """
-        Вопрос, обращённый ко мне (в личке, с упоминанием или ответом мне)
-        """
-        if self.is_question(msg) and self.is_addressed_to_me(msg):
-            return self.w("question_to_me"), "вопрос ко мне"
-        return None
-
-    def unanswered_question(self, msg: dict):
-        """
-        Вопрос ко мне, после которого я ничего не писал в этот чат
-        """
-        if not (self.is_question(msg) and self.is_addressed_to_me(msg)):
-            return None
-        last_mine = self.last_my_dates.get(msg["chat_id"])
-        if last_mine is None or last_mine < msg["msg_date"]:
-            return self.w("unanswered_question"), "вопрос без ответа: я ещё не отвечал"
+        if msg["chat_type"] == "personal_chat":
+            return self.weights["personal_chat"], "личный чат"
         return None
 
     def vip_sender(self, msg: dict):
         """
-        Отправитель из списка VIP (преподаватели, руководитель...) — config.VIP_SENDERS и правила 'sender'
+        5. VIP-отправитель: админ чата (если AUTO_VIP_ADMINS) или есть в VIP_SENDERS (часть имени или id)
         """
-        sender = (msg.get("sender_name") or "").lower()
-        sender_id = (msg.get("sender_id") or "").lower()
-        for value, weight in self.vip_senders:
-            if value and (value in sender or value == sender_id):
-                return (weight if weight is not None else self.w("vip_sender")), f"VIP-отправитель: {msg.get('sender_name')}"
-        return None
-
-    def priority_chat(self, msg: dict):
-        """
-        Приоритетный чат: ручной приоритет из таблицы chats или config.VIP_CHATS / правила 'chat'
-        """
-        chat = self._chat(msg)
-        points = chat.get("priority", 0) * self.w("priority_chat")
-        name = (chat.get("name") or "").lower()
-        for value, weight in self.vip_chats:
-            if value and value in name:
-                points += weight if weight is not None else 3 * self.w("priority_chat")
-                break
-        if points:
-            return points, f"приоритетный чат: {chat.get('name')}"
+        if config.AUTO_VIP_ADMINS and msg["is_admin"]:
+            return self.weights["vip_sender"], f"админ чата: {msg['sender']}"
+        sender = msg["sender"].lower()
+        for vip in self.vip_senders:
+            if vip in sender or vip == msg["sender_id"].lower():
+                return self.weights["vip_sender"], f"VIP-отправитель: {msg['sender']}"
         return None
 
     def keywords(self, msg: dict):
         """
-        Ключевые слова (срочно, экзамен, дедлайн...) — сумма весов найденных слов, максимум 6
+        6. Ключевые слова из KEYWORDS: сумма их весов (не больше KEYWORDS_MAX)
         """
-        text = self._text(msg)
-        if not text:
-            return None
         total, found = 0, []
         for pattern, weight in self.keyword_patterns:
-            match = pattern.search(text)
+            match = pattern.search(msg["text"])
             if match:
                 total += weight
                 found.append(match.group(0).lower())
         if total:
-            return min(total, 6) * self.w("keywords"), f"ключевые слова: {', '.join(found[:4])}"
+            points = min(total, config.KEYWORDS_MAX) * self.weights["keywords"]
+            return points, f"ключевые слова: {', '.join(found)}"
         return None
 
     def deadline(self, msg: dict):
         """
-        В сообщении есть дедлайн или дата события (их находит Deadline_Extractor)
+        7. В тексте есть дедлайн или дата события (их находит Date_Parser). Событие на балл дешевле
         """
-        deadlines = msg.get("_deadlines") or []
-        if not deadlines:
+        if not msg["deadlines"]:
             return None
-        first = deadlines[0]
-        if any(item["kind"] == "deadline" for item in deadlines):
-            return self.w("deadline"), f"дедлайн: {first['date']:%d.%m %H:%M}"
-        return max(self.w("deadline") - 1, 0), f"дата события: {first['date']:%d.%m %H:%M}"
+        first = msg["deadlines"][0]
+        if first["kind"] == "deadline":
+            return self.weights["deadline"], f"дедлайн: {first['date']:%d.%m %H:%M}"
+        return self.weights["deadline"] - 1, f"дата события: {first['date']:%d.%m %H:%M}"
 
     def deadline_soon(self, msg: dict):
         """
-        Дедлайн ещё не прошёл и наступит в ближайшие DEADLINE_SOON_DAYS дней
+        8. Дедлайн ещё не прошёл и наступит в ближайшие SOON_DAYS дней (считается от текущего момента)
         """
-        horizon = self.now + timedelta(days=config.DEADLINE_SOON_DAYS)
-        for item in msg.get("_deadlines") or []:
-            if self.now <= item["date"] <= horizon:
-                return self.w("deadline_soon"), f"дедлайн скоро: {item['date']:%d.%m %H:%M}"
+        now = datetime.now()
+        for item in msg["deadlines"]:
+            if now <= item["date"] <= now + timedelta(days=config.SOON_DAYS):
+                return self.weights["deadline_soon"], f"дедлайн скоро: {item['date']:%d.%m %H:%M}"
         return None
 
-    def urgency_marks(self, msg: dict):
+    def question_to_me(self, msg: dict):
         """
-        Восклицательные знаки, 🔥, ❗, 🚨 и т.п.
+        9. Вопрос, обращённый ко мне. Такие сообщения попадают в список "без ответа"
         """
-        if self.RE_URGENCY.search(self._text(msg)):
-            return self.w("urgency_marks"), "знаки срочности"
-        return None
-
-    def caps_lock(self, msg: dict):
-        """
-        Сообщение написано КАПСОМ (больше 70% заглавных, минимум 10 букв)
-        """
-        letters = [ch for ch in self._text(msg) if ch.isalpha()]
-        if len(letters) >= 10 and sum(ch.isupper() for ch in letters) / len(letters) > 0.7:
-            return self.w("caps_lock"), "капслок"
-        return None
-
-    def mass_mention(self, msg: dict):
-        """
-        Обращение ко всем: @all, "всем внимание", "внимание, группа"
-        """
-        match = self.RE_MASS_MENTION.search(self._text(msg))
-        if match:
-            return self.w("mass_mention"), f"обращение ко всем: {match.group(0)}"
-        return None
-
-    def pinned(self, msg: dict):
-        """
-        Сообщение закрепили в чате
-        """
-        if msg.get("is_pinned"):
-            return self.w("pinned"), "закреплённое сообщение"
+        if self.is_question(msg) and self.is_addressed_to_me(msg):
+            return self.weights["question_to_me"], "вопрос ко мне"
         return None
 
     def announcement(self, msg: dict):
         """
-        Похоже на объявление: #важно, "внимание", "напоминаю", "уважаемые коллеги"
+        10. Объявление: закреплённое сообщение, @all, "внимание", "напоминаю", "уважаемые коллеги"
         """
-        match = self.RE_ANNOUNCEMENT.search(self._text(msg))
+        if msg["is_pinned"]:
+            return self.weights["announcement"], "закреплённое сообщение"
+        match = self.RE_ANNOUNCEMENT.search(msg["text"])
         if match:
-            return self.w("announcement"), f"объявление: {match.group(0)}"
+            return self.weights["announcement"], f"объявление: {match.group(0)}"
         return None
 
-    def important_links(self, msg: dict):
+    def topic(self, msg: dict):
         """
-        Ссылки на документы, формы, LMS, созвоны
+        11. Важная тема форума (TOPIC_WEIGHTS), например "Дедлайны" или "Новости и анонсы"
         """
-        haystack = " ".join(msg.get("links") or []) + " " + self._text(msg)
-        haystack = haystack.lower()
-        for domain in self.IMPORTANT_DOMAINS:
-            if domain in haystack:
-                return self.w("important_links"), f"важная ссылка: {domain.strip('.')}"
+        topic_weight = config.TOPIC_WEIGHTS.get(msg["topic"], 0)
+        if topic_weight:
+            return topic_weight * self.weights["topic"], f"тема: {msg['topic']}"
         return None
 
-    def document_file(self, msg: dict):
+    def noise(self, msg: dict):
         """
-        Прикреплён документ (pdf, docx, xlsx, zip...)
+        Штраф за шум: "ок", "+", "ахах", стикер или фото без подписи, одни эмодзи
         """
-        file_name = (msg.get("file_name") or "").lower()
-        if file_name.endswith(self.DOCUMENT_EXTENSIONS):
-            return self.w("document_file"), f"документ: {self._short(msg['file_name'], 25)}"
+        text = msg["text"].strip().lower().rstrip("!.,?)( ")
+        if not text and msg["media"]:
+            return self.weights["noise"], f"шум: {msg['media']} без текста"
+        if text in self.noise_words or self.RE_LAUGH.match(text):
+            return self.weights["noise"], "шум: короткий ответ"
+        if text and not self.RE_HAS_WORD.search(text):
+            return self.weights["noise"], "шум: только эмодзи"
         return None
 
-    def schedule_change(self, msg: dict):
+    def score(self, msg: dict) -> dict:
         """
-        Изменения расписания: перенос, отмена, другая аудитория, "пары не будет"
-        """
-        match = self.RE_SCHEDULE_CHANGE.search(self._text(msg))
-        if match:
-            return self.w("schedule_change"), f"изменение планов: {match.group(0)}"
-        return None
-
-    def meeting_time(self, msg: dict):
-        """
-        Конкретное время + слово-событие (созвон в 18:00, пара в 9:30)
-        """
-        text = self._text(msg)
-        if self.RE_TIME.search(text) and Deadline_Extractor.RE_EVENT_WORDS.search(text):
-            return self.w("meeting_time"), "встреча/событие со временем"
-        return None
-
-    def money(self, msg: dict):
-        """
-        Деньги: оплатить, перевести, скинуться, суммы в рублях
-        """
-        match = self.RE_MONEY.search(self._text(msg))
-        if match:
-            return self.w("money"), f"деньги: {match.group(0)}"
-        return None
-
-    def popular_reactions(self, msg: dict):
-        """
-        Много реакций — сообщение заметное
-        """
-        count = msg.get("reactions_count") or 0
-        if count >= config.POPULAR_REACTIONS_MIN:
-            return self.w("popular_reactions"), f"много реакций: {count}"
-        return None
-
-    def hot_discussion(self, msg: dict):
-        """
-        На сообщение много ответили — обсуждение
-        """
-        count = self.reply_counts.get((msg["chat_id"], msg["message_id"]), 0)
-        if count >= config.HOT_DISCUSSION_MIN_REPLIES:
-            return self.w("hot_discussion"), f"обсуждение: {count} ответов"
-        return None
-
-    def long_message(self, msg: dict):
-        """
-        Длинное сообщение в группе — часто это объявление или инструкция
-        """
-        if len(self._text(msg)) >= config.LONG_MESSAGE_MIN_CHARS and not self.is_personal(msg):
-            return self.w("long_message"), "длинное сообщение"
-        return None
-
-    def noise_short(self, msg: dict):
-        """
-        Шум: "ок", "+", "спасибо", "ахах" и т.п.
-        """
-        text = self._text(msg).strip().lower()
-        normalized = re.sub(r"[!.,?\s]+$", "", text)
-        if normalized and (normalized in self.noise_words or self.RE_LAUGH.match(normalized)):
-            return self.w("noise_short"), "шум: короткий ответ"
-        return None
-
-    def media_without_text(self, msg: dict):
-        """
-        Стикер, гифка, кружок или фото без подписи
-        """
-        media = msg.get("media_type")
-        if media in self.MEDIA_NOISE:
-            return self.w("media_without_text"), f"шум: {media}"
-        if media == "photo" and not self._text(msg).strip():
-            return self.w("media_without_text"), "шум: фото без подписи"
-        return None
-
-    def emoji_only(self, msg: dict):
-        """
-        Текст состоит только из эмодзи/символов
-        """
-        text = self._text(msg).strip()
-        if text and msg.get("media_type") not in self.MEDIA_NOISE and not self.RE_HAS_WORD.search(text):
-            return self.w("emoji_only"), "шум: только эмодзи"
-        return None
-
-    def forwarded(self, msg: dict):
-        """
-        Пересланное сообщение (часто мемы и репосты)
-        """
-        if msg.get("forwarded_from"):
-            return self.w("forwarded"), f"переслано из: {self._short(str(msg['forwarded_from']), 25)}"
-        return None
-
-    def bot_message(self, msg: dict):
-        """
-        Сообщение от бота или через бота
-        """
-        sender = (msg.get("sender_name") or "").lower()
-        if msg.get("via_bot") or self._chat(msg).get("type") == "bot_chat" or sender.endswith("bot"):
-            return self.w("bot_message"), "бот"
-        return None
-
-    def muted_chat(self, msg: dict):
-        """
-        Чат заглушён командой mute
-        """
-        if self._chat(msg).get("is_muted"):
-            return self.w("muted_chat"), "заглушённый чат"
-        return None
-
-    def old_message(self, msg: dict):
-        """
-        Сообщение старше OLD_MESSAGE_DAYS дней (по умолчанию вес 0 — выключен)
-        """
-        if msg.get("msg_date") and self.now - msg["msg_date"] > timedelta(days=config.OLD_MESSAGE_DAYS):
-            return self.w("old_message"), "старое сообщение"
-        return None
-
-
-class Importance_Scorer:
-    FILTER_NAMES = [
-        "mention_me", "name_in_text", "reply_to_me", "personal_chat", "question_to_me",
-        "unanswered_question", "vip_sender", "priority_chat", "keywords", "deadline",
-        "deadline_soon", "urgency_marks", "caps_lock", "mass_mention", "pinned",
-        "announcement", "important_links", "document_file", "schedule_change", "meeting_time",
-        "money", "popular_reactions", "hot_discussion", "long_message", "noise_short",
-        "media_without_text", "emoji_only", "forwarded", "bot_message", "muted_chat", "old_message",
-    ]
-
-    def __init__(self, filters: Message_Filters, levels: dict = None, extractor: Deadline_Extractor = None):
-        """
-        Итоговая оценка: прогоняет сообщение через все включённые фильтры,
-        складывает баллы и определяет уровень (critical / high / medium / low)
-        """
-        self.filters = filters
-        self.levels = levels or config.LEVELS
-        self.extractor = extractor or Deadline_Extractor()
-        self.active = [
-            (name, getattr(filters, name))
-            for name in self.FILTER_NAMES
-            if filters.w(name) != 0 and hasattr(filters, name)
-        ]
-
-    def get_level(self, score: int) -> str:
-        """
-        Уровень важности по сумме баллов
-        """
-        if score >= self.levels["critical"]:
-            return "critical"
-        if score >= self.levels["high"]:
-            return "high"
-        if score >= self.levels["medium"]:
-            return "medium"
-        return "low"
-
-    def score_message(self, msg: dict) -> dict:
-        """
-        Оценка одного сообщения
+        Итоговая оценка: прогоняет сообщение через все фильтры и складывает баллы
         Возвращает:
-            dict: {score, level, reasons, deadlines}
-            Мои собственные сообщения не оцениваются (level = 'mine'), но дедлайны из них достаются
+            dict: score — сумма баллов, reasons — сработавшие фильтры,
+                  deadlines — найденные даты, is_question — вопрос ко мне
+        Мои собственные сообщения не оцениваются, но даты из них тоже достаются
         """
-        msg["_deadlines"] = self.extractor.extract(msg.get("msg_text") or "", msg.get("msg_date"))
+        msg["deadlines"] = self.parser.extract(msg["text"], msg["date"])
+        result = {"score": 0, "reasons": [], "deadlines": msg["deadlines"], "is_question": False}
+        if msg["is_mine"]:
+            return result
 
-        if msg.get("is_mine"):
-            return {"score": 0, "level": "mine", "reasons": [], "deadlines": msg["_deadlines"]}
-
-        score, reasons = 0, []
-        for name, check in self.active:
-            result = check(msg)
-            if result is None:
+        for name in self.FILTERS:
+            if self.weights.get(name, 0) == 0:
                 continue
-            points, reason = result
-            if points == 0:
+            verdict = getattr(self, name)(msg)
+            if verdict is None:
                 continue
-            score += points
-            reasons.append(f"{reason} ({points:+d})")
-
-        return {
-            "score": score,
-            "level": self.get_level(score),
-            "reasons": reasons,
-            "deadlines": msg["_deadlines"],
-        }
-
-
-def build_scorer(db, now: datetime = None, my_user_id=None) -> Importance_Scorer:
-    """
-    Сборка оценщика с контекстом из базы данных
-    """
-    context = {
-        "chat_info": db.get_chat_info_map(),
-        "my_keys": db.get_my_message_keys(),
-        "reply_counts": db.get_reply_counts(),
-        "last_my_dates": db.get_last_my_message_dates(),
-        "rules": db.get_rules(),
-        "now": now or datetime.now(),
-        "my_user_id": my_user_id or config.MY_USER_ID,
-    }
-    return Importance_Scorer(Message_Filters(config.FILTER_WEIGHTS, context))
-
-
-def run_analysis(db, reanalyze: bool = False, my_user_id=None, verbose: bool = True) -> dict:
-    """
-    Оценка важности всех неоценённых сообщений (или всех заново при reanalyze=True)
-    Возвращает:
-        dict: количество по уровням + найдено дедлайнов
-    """
-    if reanalyze:
-        db.clear_analysis()
-
-    scorer = build_scorer(db, my_user_id=my_user_id)
-    totals = {"critical": 0, "high": 0, "medium": 0, "low": 0, "mine": 0, "deadlines": 0}
-
-    while True:
-        batch = db.get_messages_for_analysis(only_new=True, limit=config.ANALYZE_BATCH_SIZE)
-        if not batch:
-            break
-
-        results, deadlines = [], []
-        for msg in batch:
-            verdict = scorer.score_message(msg)
-            totals[verdict["level"]] += 1
-            results.append((
-                msg["id"], verdict["score"], verdict["level"], verdict["reasons"],
-                verdict["level"] in ("mine", "low")
-            ))
-            for item in verdict["deadlines"]:
-                deadlines.append((msg["id"], item["date"], item["kind"], item["raw"]))
-
-        db.save_analysis(results)
-        db.save_deadlines(deadlines)
-        totals["deadlines"] += len(deadlines)
-        if verbose:
-            print(f"  оценено: {sum(totals[k] for k in ('critical', 'high', 'medium', 'low', 'mine'))}")
-    return totals
+            points, reason = verdict
+            result["score"] += points
+            result["reasons"].append(f"{reason} ({points:+d})")
+            if name == "question_to_me":
+                result["is_question"] = True
+        return result

@@ -1,127 +1,111 @@
 """
-Настройки проекта TG Radar.
-
-Здесь всё, что меняется под конкретного человека:
-- подключение к PostgreSQL
-- данные Telegram API (нужны только для режимов live и sync)
-- кто такой "я" (username, имя, id) — от этого зависят упоминания и ответы мне
-- веса фильтров важности (вес 0 = фильтр выключен)
-- ключевые слова, VIP-отправители, пороги уровней
+Настройки TG Radar.
+Всё, что меняется под конкретного человека, лежит здесь.
+После изменения весов или ключевых слов не нужно перезапускать программу: достаточно команды rescore.
 """
 
-DB_SETTINGS = {
-    "dbname": "tg_radar",
-    "user": "postgres",
-    "password": "postgres",
-    "host": "localhost",
-    "port": 5432,
-}
+"""
+Файлы: база данных SQLite и экспорт Telegram Desktop по умолчанию (для команды import без аргумента)
+"""
+DB_PATH = "tg_radar.db"
+EXPORT_PATH = "result.json"
 
 """
-Telegram API: получить api_id и api_hash можно на https://my.telegram.org -> API development tools.
-Нужны только для команд live / sync. Для работы с экспортом (result.json) не нужны.
-При первом запуске Telethon сам спросит номер телефона и код в терминале.
+Кто я.
+MY_USER_ID — мой id в Telegram (нужен, чтобы отличать мои сообщения: "ответ мне", "вопрос без ответа").
+В экспорте одного чата его нет, поэтому он задаётся здесь. Узнать свой id можно у бота @userinfobot.
+MY_USERNAME — по нему ищутся упоминания, MY_NAMES — корни имени для обращений.
 """
-TG_API_ID = 0
-TG_API_HASH = ""
-TG_SESSION_NAME = "tg_radar_session"
-TG_PHONE = ""
+MY_USER_ID = 921867836
+MY_USERNAME = "@BleckPrime"
+MY_NAMES = ["булат", "bulat", "bulity"]
 
 """
-Опциональный бот для уведомлений (токен от @BotFather, chat_id — ваш id).
-Если пусто — уведомления пишутся только в терминал и (в live-режиме) в «Избранное».
+Какие чаты брать из ПОЛНОГО экспорта (в экспорте одного чата берётся он сам).
+WATCH_CHATS — часть названия, регистр не важен. Пустой список = все группы.
+WATCH_ALL_PERSONAL — брать ли все личные чаты.
 """
-BOT_TOKEN = ""
-BOT_CHAT_ID = ""
-NOTIFY_SAVED_MESSAGES = True
-NOTIFY_MIN_LEVEL = "high"
+WATCH_CHATS = []
+WATCH_ALL_PERSONAL = True
 
 """
-Кто я. MY_USER_ID подтягивается из полного экспорта автоматически,
-но если экспортируете один чат — впишите его руками (узнать можно у @userinfobot).
-MY_NAMES — корни имени, по ним ищется обращение по имени в тексте (Булат, Булата, Булату...).
+Сообщение считается важным, если набрало не меньше IMPORTANT_SCORE баллов
 """
-MY_USER_ID = None
-MY_USERNAME = "@your_username"
-MY_NAMES = ["булат", "bulat", "усманов"]
+IMPORTANT_SCORE = 5
 
-EXPORT_PATH = "export/result.json"
-SKIP_CHAT_TYPES = []
-STATS_DIR = "stats"
-
-LEVELS = {
-    "critical": 9,
-    "high": 6,
-    "medium": 3,
-}
-
-FILTER_WEIGHTS = {
+"""
+Веса фильтров. Вес 0 выключает фильтр, отрицательный вес — штраф.
+"""
+WEIGHTS = {
     "mention_me": 4,
     "name_in_text": 3,
     "reply_to_me": 4,
     "personal_chat": 2,
-    "question_to_me": 2,
-    "unanswered_question": 2,
     "vip_sender": 3,
-    "priority_chat": 1,
     "keywords": 1,
     "deadline": 3,
     "deadline_soon": 2,
-    "urgency_marks": 1,
-    "caps_lock": 1,
-    "mass_mention": 2,
-    "pinned": 3,
+    "question_to_me": 3,
     "announcement": 2,
-    "important_links": 1,
-    "document_file": 1,
-    "schedule_change": 2,
-    "meeting_time": 1,
-    "money": 1,
-    "popular_reactions": 1,
-    "hot_discussion": 1,
-    "long_message": 1,
-    "noise_short": -3,
-    "media_without_text": -2,
-    "emoji_only": -2,
-    "forwarded": -1,
-    "bot_message": -1,
-    "muted_chat": -4,
-    "old_message": 0,
+    "topic": 1,
+    "noise": -3,
 }
 
+"""
+Веса тем (для групп с темами). Итоговые баллы = вес темы * WEIGHTS["topic"].
+Темы, которых нет в словаре, получают 0.
+"""
+TOPIC_WEIGHTS = {
+    "Дедлайны": 4,
+    "Новости и анонсы": 3,
+    "Расписание": 2,
+}
+
+"""
+VIP-отправители: часть имени или id из экспорта (например "user1495038766").
+Список участников с id показывает команда senders.
+AUTO_VIP_ADMINS — автоматически считать VIP тех, кто создавал/менял темы или закреплял сообщения (это могут только админы).
+"""
+VIP_SENDERS = []
+AUTO_VIP_ADMINS = True
+
+"""
+Дедлайн считается "скорым", если до него не больше SOON_DAYS дней
+"""
+SOON_DAYS = 3
+
+"""
+Ключевые слова: регулярное выражение -> вес. Сумма весов ограничена KEYWORDS_MAX.
+"""
 KEYWORDS = {
     r"\bсрочн": 3,
     r"\basap\b": 3,
+    r"!{2,}|❗|‼|🔥|🚨": 1,
     r"\bважн": 2,
-    r"\bдедлайн": 3,
-    r"\bdeadline": 3,
+    r"\bдедлайн|\bdeadline": 3,
     r"\bэкзамен": 3,
     r"\bпересдач": 3,
     r"\bзач[её]т": 2,
     r"\bконтрольн": 2,
     r"\bколлоквиум": 2,
     r"\bсдать\b|\bсдач": 2,
-    r"\bдомашк|\bдз\b": 2,
+    r"\bдомашн|\bдомашк|\bдз\b": 2,
     r"\bведомост": 2,
-    r"\bоценк": 1,
-    r"\bбалл": 1,
-    r"\bрасписани": 1,
+    r"\bоценк|\bбалл|\bнакоп": 1,
     r"\bобязательн": 2,
-    r"\bнапомина": 1,
-    r"\bпроверь|\bпосмотри": 1,
+    r"\bперенос|\bперенес|\bотмен|\bне будет\b": 2,
+    r"\bрасписани": 1,
+    r"\bаудитори|\bауд\.": 1,
 }
+KEYWORDS_MAX = 6
 
-VIP_SENDERS = []
-VIP_CHATS = []
-
+"""
+Шум: короткие сообщения, которые почти никогда не бывают важными
+"""
 NOISE_WORDS = [
-    "ок", "ok", "окей", "+", "++", "спс", "спасибо", "пасиб", "ага", "угу", "да", "нет",
-    "лол", "кек", "ясно", "понял", "поняла", "норм", "го", "ахах", "хаха", "))", ")", "👍", "👌",
+    "ок", "ok", "окей", "+", "++", "спс", "спасибо", "спасибо большое", "пасиб", "ага", "угу", "да", "нет",
+    "лол", "кек", "ясно", "понял", "поняла", "понятно", "норм", "го", "ахах", "хаха", "жиза", "хорошо",
 ]
 
-POPULAR_REACTIONS_MIN = 5
-HOT_DISCUSSION_MIN_REPLIES = 5
-LONG_MESSAGE_MIN_CHARS = 350
-OLD_MESSAGE_DAYS = 30
-DEADLINE_SOON_DAYS = 3
-ANALYZE_BATCH_SIZE = 2000
+STATS_DIR = "stats"
+STATS_DAYS = 30
