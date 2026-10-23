@@ -50,14 +50,25 @@ class Date_Parser:
     )
 
     WORD_NUMBERS = {"пару": 2, "одну": 1, "две": 2, "три": 3}
+    DAYS_IN_WEEK = 7
+    MONTHS_IN_YEAR = 12
+    MAX_DAY_IN_MONTH = 31
+    CENTURY = 2000
 
-    def __init__(self, default_hour: int = 23, default_minute: int = 59):
+    def __init__(self, default_hour: int = config.DEFAULT_DEADLINE_HOUR,
+                 default_minute: int = config.DEFAULT_DEADLINE_MINUTE):
         """
         Извлечение дат и дедлайнов из текста регулярками
-        Если время не указано — ставится default_hour:default_minute (по умолчанию 23:59)
+        Если время не указано — ставится default_hour:default_minute (по умолчанию 23:59 из config.py)
         """
         self.default_hour = default_hour
         self.default_minute = default_minute
+
+    def _day_start(self, moment: datetime) -> datetime:
+        """
+        Начало дня (00:00) для момента moment
+        """
+        return datetime(moment.year, moment.month, moment.day)
 
     def _build_date(self, day: int, month: int, year, base: datetime):
         """
@@ -67,12 +78,12 @@ class Date_Parser:
         try:
             if year is None:
                 result = datetime(base.year, month, day)
-                if result < base - timedelta(days=60):
+                if result < base - timedelta(days=config.YEAR_ROLLOVER_DAYS):
                     result = datetime(base.year + 1, month, day)
                 return result
             year = int(year)
-            if year < 100:
-                year += 2000
+            if year < self.CENTURY:
+                year += self.CENTURY
             return datetime(year, month, day)
         except ValueError:
             return None
@@ -98,7 +109,7 @@ class Date_Parser:
         if match is None:
             for candidate in self.RE_TIME_DOT.finditer(text):
                 minutes = int(candidate.group(2))
-                if minutes == 0 or minutes > 12:
+                if minutes == 0 or minutes > self.MONTHS_IN_YEAR:
                     match = candidate
                     break
         if match is None:
@@ -110,7 +121,7 @@ class Date_Parser:
         """
         Абсолютные даты: 2026-10-25, 25.10, 25.10.2026, 25/10/2026, 25 октября
         Формат 25/10 без года не берётся — слишком часто это оценка (8/10), а не дата.
-        Месяц в формате 25.10 — только две цифры, а дата без года — не дальше 120 дней вперёд:
+        Месяц в формате 25.10 — только две цифры, а дата без года — не дальше MAX_DAYS_AHEAD дней вперёд:
         иначе дробные числа вроде "2.2 балла" или "1.04" превращаются в даты
         Возвращает:
             список (datetime, исходный_фрагмент)
@@ -125,11 +136,11 @@ class Date_Parser:
         for pattern in (self.RE_NUMERIC, self.RE_SLASH):
             for match in pattern.finditer(text_wo_iso):
                 day, month = int(match.group(1)), int(match.group(2))
-                if 1 <= day <= 31 and 1 <= month <= 12:
+                if 1 <= day <= self.MAX_DAY_IN_MONTH and 1 <= month <= self.MONTHS_IN_YEAR:
                     date = self._build_date(day, month, match.group(3), base)
                     if date is None:
                         continue
-                    if match.group(3) is None and date - base > timedelta(days=120):
+                    if match.group(3) is None and date - base > timedelta(days=config.MAX_DAYS_AHEAD):
                         continue
                     found.append((date, match.group(0)))
 
@@ -147,7 +158,7 @@ class Date_Parser:
         Отсчёт идёт от даты сообщения, а не от сегодняшнего дня
         """
         found = []
-        start = datetime(base.year, base.month, base.day)
+        start = self._day_start(base)
 
         for match in self.RE_RELATIVE_DAY.finditer(text):
             word = match.group(1).lower()
@@ -161,8 +172,8 @@ class Date_Parser:
             else:
                 amount = self.WORD_NUMBERS.get(amount_raw, 1)
             unit = match.group(2).lower()
-            days = amount * 7 if unit.startswith("недел") else amount
-            if 0 < days <= 120:
+            days = amount * self.DAYS_IN_WEEK if unit.startswith("недел") else amount
+            if 0 < days <= config.MAX_DAYS_AHEAD:
                 found.append((start + timedelta(days=days), match.group(0)))
 
         for match in self.RE_WEEKDAY.finditer(text):
@@ -170,9 +181,9 @@ class Date_Parser:
             target = next((num for root, num in self.WEEKDAYS.items() if word.startswith(root)), None)
             if target is None:
                 continue
-            shift = (target - start.weekday()) % 7
+            shift = (target - start.weekday()) % self.DAYS_IN_WEEK
             if shift == 0:
-                shift = 7
+                shift = self.DAYS_IN_WEEK
             found.append((start + timedelta(days=shift), match.group(0)))
         return found
 
@@ -212,13 +223,13 @@ class Date_Parser:
         if is_deadline or is_event:
             found += self.find_relative_dates(text_wo_time, base)
             if not found and hour is not None:
-                found.append((datetime(base.year, base.month, base.day), "сегодня"))
+                found.append((self._day_start(base), "сегодня"))
 
         if not found:
             return []
 
         kind = "deadline" if is_deadline else "event"
-        message_day = datetime(base.year, base.month, base.day)
+        message_day = self._day_start(base)
         result, seen = [], set()
         for date, raw in found:
             if date < message_day:
@@ -352,14 +363,15 @@ class Message_Filters:
 
     def deadline(self, msg: dict):
         """
-        7. В тексте есть дедлайн или дата события (их находит Date_Parser). Событие на балл дешевле
+        7. В тексте есть дедлайн или дата события (их находит Date_Parser). Событие дешевле на EVENT_DISCOUNT
         """
         if not msg["deadlines"]:
             return None
         first = msg["deadlines"][0]
+        when = first["date"].strftime(config.SHORT_DATE_FORMAT)
         if first["kind"] == "deadline":
-            return self.weights["deadline"], f"дедлайн: {first['date']:%d.%m %H:%M}"
-        return self.weights["deadline"] - 1, f"дата события: {first['date']:%d.%m %H:%M}"
+            return self.weights["deadline"], f"дедлайн: {when}"
+        return self.weights["deadline"] - config.EVENT_DISCOUNT, f"дата события: {when}"
 
     def deadline_soon(self, msg: dict):
         """
@@ -368,7 +380,7 @@ class Message_Filters:
         now = datetime.now()
         for item in msg["deadlines"]:
             if now <= item["date"] <= now + timedelta(days=config.SOON_DAYS):
-                return self.weights["deadline_soon"], f"дедлайн скоро: {item['date']:%d.%m %H:%M}"
+                return self.weights["deadline_soon"], f"дедлайн скоро: {item['date'].strftime(config.SHORT_DATE_FORMAT)}"
         return None
 
     def question_to_me(self, msg: dict):

@@ -1,5 +1,8 @@
 import importlib
+import json
 import os
+import re
+import sqlite3
 import sys
 from datetime import datetime, timedelta
 
@@ -21,35 +24,66 @@ class TG_Radar:
         """
         self.db = Telegram_DB(config.DB_PATH)
 
-    def short(self, text, length: int = 90) -> str:
+    def short(self, text, length: int = config.TEXT_WIDTH) -> str:
         """
         Текст в одну строку, обрезанный до length символов
         """
         text = " ".join(str(text or "").split())
         return text if len(text) <= length else text[:length - 1] + "…"
 
-    def parse_day(self, value: str) -> str:
+    def parse_day(self, value: str, last_day: str) -> str:
         """
         Дата из ввода пользователя -> "ГГГГ-ММ-ДД".
-        Понимает 22.10, 22.10.2026 и 2026-10-22; год по умолчанию — год последнего сообщения в базе
+        Понимает 22.10, 22.10.2026 и 2026-10-22; год по умолчанию — год последнего дня в базе (last_day)
+        Исключения:
+            ValueError — если дата написана неправильно или не существует (40.10)
         """
         if "-" in value:
-            return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d")
+            return datetime.strptime(value, config.DAY_FORMAT).strftime(config.DAY_FORMAT)
         parts = value.split(".")
-        year = int(parts[2]) if len(parts) == 3 else int(self.db.get_last_date()[:4])
-        return datetime(year, int(parts[1]), int(parts[0])).strftime("%Y-%m-%d")
+        if len(parts) not in (2, 3):
+            raise ValueError(f"неверный формат даты: {value}")
+        year = int(parts[2]) if len(parts) == 3 else int(last_day[:4])
+        return datetime(year, int(parts[1]), int(parts[0])).strftime(config.DAY_FORMAT)
 
-    def print_rows(self, rows, empty_text: str):
+    def require_data(self):
         """
-        Вывод списка сообщений: (id, дата, место, отправитель, текст, баллы)
+        Дата последнего сообщения в базе. Если база пустая — сообщение пользователю и None
+        """
+        last_day = self.db.get_last_date()
+        if last_day is None:
+            print("База пустая, сначала import")
+        return last_day
+
+    def kind_label(self, kind: str) -> str:
+        """
+        Подпись вида даты для вывода
+        """
+        return "дедлайн" if kind == "deadline" else "событие"
+
+    def print_rows(self, rows, empty_text: str, with_reasons: bool = False):
+        """
+        Вывод списка сообщений: (id, дата, место, отправитель, текст, баллы[, причины])
+        with_reasons — показать третьей строкой, почему сообщение важное
         """
         if not rows:
             print(empty_text)
             return
         for row in rows:
             ref, date, place, sender, text, score = row[:6]
-            print(f"#{ref:<5} [{score:>2}] {date[:16]}  {self.short(place, 30)} · {self.short(sender, 20)}")
+            print(f"#{ref:<5} [{score:>2}] {date[:16]}  {self.short(place, config.PLACE_WIDTH)} · "
+                  f"{self.short(sender, config.NAME_WIDTH)}")
             print(f"        {self.short(text) or '(без текста)'}")
+            if with_reasons:
+                print(f"        почему: {self.short(row[6])}")
+
+    def print_deadline(self, row, mark: str = " "):
+        """
+        Одна строка дедлайна: (id, дата, вид, место, текст); mark — цветной кружок срочности
+        """
+        deadline_id, date, kind, place, text = row
+        print(f"{mark} {deadline_id:<4} {date}  {self.kind_label(kind):<8} "
+              f"{self.short(place, config.PLACE_WIDTH):<{config.PLACE_WIDTH}} {self.short(text, config.SHORT_TEXT_WIDTH)}")
 
     def score_messages(self, only_new: bool = True) -> int:
         """
@@ -82,10 +116,35 @@ class TG_Radar:
             print("! MY_USER_ID в config.py не задан: не будут работать 'ответ мне' и 'вопросы без ответа'")
 
         parser = Telegram_Export_Parser(config.MY_USER_ID)
-        for chat_id, name, records, admins in parser.parse(path):
+        try:
+            chats = parser.parse(path)
+        except FileNotFoundError:
+            print(f"В папке {path} нет файла result.json")
+            return
+        except PermissionError:
+            print(f"Нет доступа к файлу {path}")
+            return
+        except UnicodeDecodeError:
+            print("Файл не в кодировке UTF-8 — это не экспорт Telegram")
+            return
+        except json.JSONDecodeError:
+            print("Файл не является JSON. При экспорте нужно выбрать формат «Машиночитаемый JSON», а не HTML")
+            return
+        except KeyError as e:
+            print(f"В файле не хватает поля {e}. Это точно экспорт Telegram Desktop?")
+            return
+        except (TypeError, AttributeError):
+            print("Неожиданная структура файла. Это точно экспорт Telegram Desktop?")
+            return
+        if not chats:
+            print("В файле не найдено ни одного подходящего чата (проверьте WATCH_CHATS в config.py)")
+            return
+
+        for chat_id, name, records, admins in chats:
             added = self.db.insert_messages(records)
             self.db.mark_admins(chat_id, admins)
-            print(f"  {self.short(name, 40):<40} сообщений: {len(records)}, новых: {added}, админов: {len(admins)}")
+            print(f"  {self.short(name, config.PLACE_WIDTH):<{config.PLACE_WIDTH}} "
+                  f"сообщений: {len(records)}, новых: {added}, админов: {len(admins)}")
         scored = self.score_messages(only_new=True)
         print(f"Оценено новых сообщений: {scored}. Сводка за последний день: day")
 
@@ -94,36 +153,33 @@ class TG_Radar:
         Главная команда — сводка за день: где сколько писали, что важного, новые дедлайны, кто ждёт ответа.
         day — последний день в базе, day 22.10 — конкретный день
         """
-        try:
-            day = self.parse_day(args[0]) if args else self.db.get_last_date()
-        except (ValueError, IndexError):
-            print("Не понял дату. Примеры: day 22.10, day 22.10.2026")
+        last_day = self.require_data()
+        if last_day is None:
             return
-        if day is None:
-            print("База пустая, сначала import")
+        try:
+            day = self.parse_day(args[0], last_day) if args else last_day
+        except ValueError:
+            print("Не понял дату. Примеры: day 22.10, day 22.10.2026")
             return
         overview = self.db.get_day_overview(day, config.IMPORTANT_SCORE)
         total = sum(row[1] for row in overview)
-        print(f"===== Сводка за {datetime.strptime(day, '%Y-%m-%d'):%d.%m.%Y}: {total} сообщений =====")
+        print(f"===== Сводка за {datetime.strptime(day, config.DAY_FORMAT):%d.%m.%Y}: {total} сообщений =====")
         if not overview:
             return
 
         print("\nГде писали (всего / важных):")
         for place, count, important in overview:
-            print(f"  {self.short(place, 40):<40} {count:>4} / {important}")
+            print(f"  {self.short(place, config.PLACE_WIDTH):<{config.PLACE_WIDTH}} {count:>4} / {important}")
 
         print("\nВажное:")
-        for ref, date, place, sender, text, score, reasons in self.db.get_important(config.IMPORTANT_SCORE, day, day, limit=10):
-            print(f"#{ref:<5} [{score:>2}] {date[11:16]}  {self.short(place, 30)} · {self.short(sender, 20)}")
-            print(f"        {self.short(text)}")
-            print(f"        почему: {self.short(reasons, 85)}")
+        important = self.db.get_important(config.IMPORTANT_SCORE, day, day, limit=config.DAY_IMPORTANT_LIMIT)
+        self.print_rows(important, "Ничего важного", with_reasons=True)
 
         deadlines = self.db.get_deadlines(created_on=day)
         if deadlines:
             print("\nНовые даты из сообщений этого дня:")
-            for deadline_id, date, kind, place, text in deadlines:
-                label = "дедлайн" if kind == "deadline" else "событие"
-                print(f"  {date}  {label:<8} {self.short(place, 25):<25} {self.short(text, 55)}")
+            for row in deadlines:
+                self.print_deadline(row)
 
         unanswered = self.db.get_unanswered(day)
         if unanswered:
@@ -132,14 +188,17 @@ class TG_Radar:
 
     def cmd_important(self, args):
         """
-        Важные сообщения за последние N дней до последнего сообщения в базе (по умолчанию 7)
+        Важные сообщения за последние N дней до последнего сообщения в базе (по умолчанию IMPORTANT_DEFAULT_DAYS)
         """
-        days = int(args[0]) if args and args[0].isdigit() else 7
-        last = self.db.get_last_date()
-        if last is None:
-            print("База пустая, сначала import")
+        if args and (not args[0].isdigit() or int(args[0]) < 1):
+            print("Пример: important 3 (число дней больше нуля)")
             return
-        first = (datetime.strptime(last, "%Y-%m-%d") - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        days = int(args[0]) if args else config.IMPORTANT_DEFAULT_DAYS
+        last = self.require_data()
+        if last is None:
+            return
+        first_day = datetime.strptime(last, config.DAY_FORMAT) - timedelta(days=days - 1)
+        first = first_day.strftime(config.DAY_FORMAT)
         rows = self.db.get_important(config.IMPORTANT_SCORE, first, last)
         self.print_rows(rows, f"За {days} дн. важного нет")
 
@@ -171,15 +230,15 @@ class TG_Radar:
         """
         now = datetime.now()
         min_score = None if "all" in args else config.IMPORTANT_SCORE
-        rows = self.db.get_deadlines(date_from=now.strftime("%Y-%m-%d 00:00"), min_score=min_score)
+        today = now.replace(hour=0, minute=0).strftime(config.DEADLINE_FORMAT)
+        rows = self.db.get_deadlines(date_from=today, min_score=min_score)
         if not rows:
             print("Дедлайнов нет")
             return
-        for deadline_id, date, kind, place, text in rows:
-            days_left = (datetime.strptime(date, "%Y-%m-%d %H:%M") - now).days
-            mark = "🔴" if days_left < 1 else "🟡" if days_left < config.SOON_DAYS else "🟢"
-            label = "дедлайн" if kind == "deadline" else "событие"
-            print(f"{mark} {deadline_id:<4} {date}  {label:<8} {self.short(place, 25):<25} {self.short(text, 60)}")
+        for row in rows:
+            days_left = (datetime.strptime(row[1], config.DEADLINE_FORMAT) - now).days
+            mark = "🔴" if days_left < config.URGENT_DAYS else "🟡" if days_left < config.SOON_DAYS else "🟢"
+            self.print_deadline(row, mark)
         print("Отметить выполненным: done <номер>")
 
     def cmd_done(self, args):
@@ -212,26 +271,26 @@ class TG_Radar:
         """
         Самые активные участники с id — чтобы выбрать преподавателей для VIP_SENDERS
         """
-        print(f"{'имя':<25} {'id':<16} {'сообщ.':>6} {'важных':>6}")
+        width = config.NAME_WIDTH
+        print(f"{'имя':<{width}} {'id':<16} {'сообщ.':>6} {'важных':>6}")
         for sender, sender_id, total, important, is_admin in self.db.get_senders(config.IMPORTANT_SCORE):
             mark = " (админ)" if is_admin else ""
-            print(f"{self.short(sender, 25):<25} {sender_id:<16} {total:>6} {important:>6}{mark}")
+            print(f"{self.short(sender, width):<{width}} {sender_id:<16} {total:>6} {important:>6}{mark}")
 
     def cmd_stats(self, args):
         """
         Четыре графика на одной картинке: активность по дням, темы/чаты, участники, часы.
         Картинка сохраняется в STATS_DIR и сразу открывается
         """
-        last = self.db.get_last_date()
+        last = self.require_data()
         if last is None:
-            print("База пустая, сначала import")
             return
         by_day = self.db.get_activity_by_day(config.IMPORTANT_SCORE, last, config.STATS_DAYS)
         places = self.db.get_top_places(config.IMPORTANT_SCORE)[::-1]
-        senders = self.db.get_senders(config.IMPORTANT_SCORE, limit=10)[::-1]
+        senders = self.db.get_senders(config.IMPORTANT_SCORE, limit=config.TOP_LIMIT)[::-1]
         by_hour = dict(self.db.get_activity_by_hour())
 
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=config.STATS_FIGSIZE)
         days = [row[0][5:] for row in by_day]
         ax1.plot(days, [row[1] for row in by_day], marker="o", label="все")
         ax1.plot(days, [row[2] for row in by_day], marker="o", color="crimson", label="важные")
@@ -239,13 +298,13 @@ class TG_Radar:
         ax1.tick_params(axis="x", rotation=70, labelsize=8)
         ax1.legend()
 
-        names = [self.short(row[0], 30) for row in places]
+        names = [self.short(row[0], config.PLACE_WIDTH) for row in places]
         ax2.barh(names, [row[1] for row in places], label="все")
         ax2.barh(names, [row[2] for row in places], color="crimson", label="важные")
         ax2.set_title("Темы и чаты")
         ax2.legend()
 
-        names = [self.short(row[0], 20) for row in senders]
+        names = [self.short(row[0], config.NAME_WIDTH) for row in senders]
         ax3.barh(names, [row[2] for row in senders], label="все")
         ax3.barh(names, [row[3] for row in senders], color="crimson", label="важные")
         ax3.set_title("Самые активные участники")
@@ -255,20 +314,32 @@ class TG_Radar:
         ax4.set_xticks(range(24))
         ax4.set_title("Активность по часам")
 
-        os.makedirs(config.STATS_DIR, exist_ok=True)
         path = os.path.join(config.STATS_DIR, f"stats_{datetime.now():%Y%m%d_%H%M%S}.png")
         fig.tight_layout()
-        fig.savefig(path, dpi=110)
-        plt.close(fig)
+        try:
+            os.makedirs(config.STATS_DIR, exist_ok=True)
+            fig.savefig(path, dpi=config.STATS_DPI)
+        except OSError as e:
+            print(f"Не удалось сохранить график в {config.STATS_DIR}: {e}")
+            return
+        finally:
+            plt.close(fig)
         print(f"График сохранён: {path}")
         if hasattr(os, "startfile"):
-            os.startfile(path)
+            try:
+                os.startfile(path)
+            except OSError:
+                print("Не удалось открыть картинку автоматически — откройте файл вручную")
 
     def cmd_rescore(self, args):
         """
         Перечитать config.py и пересчитать оценки всех сообщений — без перезапуска программы
         """
-        importlib.reload(config)
+        try:
+            importlib.reload(config)
+        except (SyntaxError, NameError) as e:
+            print(f"Ошибка в config.py, изменения не применены: {e}")
+            return
         count = self.score_messages(only_new=False)
         print(f"Пересчитано сообщений: {count}")
 
@@ -286,7 +357,8 @@ class TG_Radar:
         return {
             "import": (self.cmd_import, "import [путь] — загрузить result.json (по умолчанию EXPORT_PATH)"),
             "day": (self.cmd_day, "day [22.10] — сводка за день (по умолчанию последний день)"),
-            "important": (self.cmd_important, "important [N] — важное за N дней (по умолчанию 7)"),
+            "important": (self.cmd_important,
+                          f"important [N] — важное за N дней (по умолчанию {config.IMPORTANT_DEFAULT_DAYS})"),
             "show": (self.cmd_show, "show <id> — сообщение целиком и почему оно важное"),
             "deadlines": (self.cmd_deadlines, "ближайшие дедлайны из важных сообщений (deadlines all — из всех)"),
             "done": (self.cmd_done, "done <номер> — дедлайн выполнен"),
@@ -326,13 +398,24 @@ class TG_Radar:
                 continue
             try:
                 commands[name][0](args)
-            except Exception as e:
-                print(f"! Ошибка: {e}")
+            except sqlite3.Error as e:
+                print(f"! Ошибка базы данных: {e}. Если таблиц нет — выполните python init_db.py")
+            except re.error as e:
+                print(f"! Неправильное регулярное выражение в config.py (KEYWORDS или MY_NAMES): {e}")
+            except KeyboardInterrupt:
+                print("\nКоманда прервана")
             print()
 
 
 def main():
-    app = TG_Radar()
+    """
+    Точка входа: открыть базу, проверить таблицы, запустить цикл команд
+    """
+    try:
+        app = TG_Radar()
+    except sqlite3.Error as e:
+        print(f"Не удалось открыть базу {config.DB_PATH}: {e}")
+        sys.exit(1)
     if not app.db.tables_exist():
         print(f"В {config.DB_PATH} нет таблиц. Сначала выполните: python init_db.py")
         sys.exit(1)

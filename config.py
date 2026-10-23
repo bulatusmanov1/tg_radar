@@ -107,5 +107,54 @@ NOISE_WORDS = [
     "лол", "кек", "ясно", "понял", "поняла", "понятно", "норм", "го", "ахах", "хаха", "жиза", "хорошо",
 ]
 
+"""
+Статистика: папка для картинок, за сколько дней строить график по дням, размер и качество картинки
+"""
 STATS_DIR = "stats"
 STATS_DAYS = 30
+STATS_FIGSIZE = (15, 10)
+STATS_DPI = 110
+
+"""
+Технические константы.
+Форматы дат: так даты хранятся в базе (строками, поэтому их можно сравнивать и сортировать)
+"""
+DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+DEADLINE_FORMAT = "%Y-%m-%d %H:%M"
+DAY_FORMAT = "%Y-%m-%d"
+SHORT_DATE_FORMAT = "%d.%m %H:%M"
+
+"""
+Парсер дат.
+DEFAULT_DEADLINE_HOUR/MINUTE — время дедлайна, если в тексте указана только дата.
+MAX_DAYS_AHEAD — дата без года или "через N дней" дальше этого срока считается ошибкой распознавания.
+YEAR_ROLLOVER_DAYS — если дата без года ушла в прошлое больше чем на столько дней, это следующий год.
+EVENT_DISCOUNT — насколько событие (экзамен 27.10) дешевле дедлайна (сдать до 27.10).
+"""
+DEFAULT_DEADLINE_HOUR = 23
+DEFAULT_DEADLINE_MINUTE = 59
+MAX_DAYS_AHEAD = 120
+YEAR_ROLLOVER_DAYS = 60
+EVENT_DISCOUNT = 1
+
+"""
+Названия по умолчанию, если в экспорте их нет
+"""
+GENERAL_TOPIC = "Общая тема"
+UNKNOWN_SENDER = "Без имени"
+UNKNOWN_CHAT = "Без названия"
+
+"""
+Вывод в терминал.
+Лимиты — сколько строк показывать, ширины — до скольких символов обрезать текст.
+URGENT_DAYS — дедлайн красный, если до него меньше стольких дней (жёлтый — меньше SOON_DAYS).
+"""
+LIST_LIMIT = 20
+DAY_IMPORTANT_LIMIT = 10
+TOP_LIMIT = 10
+IMPORTANT_DEFAULT_DAYS = 7
+URGENT_DAYS = 1
+TEXT_WIDTH = 90
+SHORT_TEXT_WIDTH = 60
+PLACE_WIDTH = 35
+NAME_WIDTH = 20

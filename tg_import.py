@@ -34,7 +34,7 @@ class Telegram_Export_Parser:
 
         chats = []
         for chat in data.get("chats", {}).get("list", []):
-            name = (chat.get("name") or "").lower()
+            name = self.chat_name(chat).lower()
             if chat.get("type") == "personal_chat":
                 if config.WATCH_ALL_PERSONAL:
                     chats.append(chat)
@@ -42,6 +42,12 @@ class Telegram_Export_Parser:
                 if not config.WATCH_CHATS or any(watch.lower() in name for watch in config.WATCH_CHATS):
                     chats.append(chat)
         return chats
+
+    def chat_name(self, chat: dict) -> str:
+        """
+        Название чата
+        """
+        return chat.get("name") or config.UNKNOWN_CHAT
 
     def flatten_text(self, text) -> str:
         """
@@ -86,7 +92,7 @@ class Telegram_Export_Parser:
         """
         path = []
         current = message_id
-        topic = "Общая тема"
+        topic = config.GENERAL_TOPIC
         while current is not None:
             if current in topics:
                 topic = topics[current]
@@ -130,11 +136,11 @@ class Telegram_Export_Parser:
             from_id = msg.get("from_id") or ""
             records.append({
                 "chat_id": chat["id"],
-                "chat_name": chat.get("name") or "Без названия",
+                "chat_name": self.chat_name(chat),
                 "chat_type": chat.get("type"),
                 "topic": self.get_topic(msg["id"], reply_to, topics, cache) if topics else None,
                 "message_id": msg["id"],
-                "sender": msg.get("from") or "Без имени",
+                "sender": msg.get("from") or config.UNKNOWN_SENDER,
                 "sender_id": from_id,
                 "date": msg["date"].replace("T", " "),
                 "text": self.flatten_text(msg.get("text", "")),
@@ -156,5 +162,5 @@ class Telegram_Export_Parser:
         result = []
         for chat in self.get_chats(data):
             records, admins = self.parse_chat(chat)
-            result.append((chat["id"], chat.get("name") or "Без названия", records, admins))
+            result.append((chat["id"], self.chat_name(chat), records, admins))
         return result

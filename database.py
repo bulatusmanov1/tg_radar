@@ -1,6 +1,12 @@
 import sqlite3
 from datetime import datetime
 
+import config
+
+PLACE_SQL = "COALESCE(topic, chat_name)"
+DAY_SQL = "substr(date, 1, 10)"
+IMPORTANT_SQL = "SUM(score >= ? AND is_mine = 0)"
+
 
 class Telegram_DB:
     def __init__(self, db_path):
@@ -120,7 +126,7 @@ class Telegram_DB:
         self.cursor.execute(f'SELECT * FROM messages {condition} ORDER BY date;')
         messages = [dict(row) for row in self.cursor.fetchall()]
         for msg in messages:
-            msg["date"] = datetime.strptime(msg["date"], "%Y-%m-%d %H:%M:%S")
+            msg["date"] = datetime.strptime(msg["date"], config.DATETIME_FORMAT)
         return messages
 
     def get_my_message_keys(self) -> set:
@@ -147,7 +153,7 @@ class Telegram_DB:
             self.cursor.execute('''
                 INSERT OR IGNORE INTO deadlines (message_ref, date, kind, raw)
                 VALUES (?, ?, ?, ?);
-            ''', (message_ref, item["date"].strftime("%Y-%m-%d %H:%M"), item["kind"], item["raw"]))
+            ''', (message_ref, item["date"].strftime(config.DEADLINE_FORMAT), item["kind"], item["raw"]))
 
     def update_answered(self):
         """
@@ -185,23 +191,23 @@ class Telegram_DB:
         """
         Сводка за день по местам (тема или чат): (место, всего сообщений, важных)
         """
-        self.cursor.execute('''
-            SELECT COALESCE(topic, chat_name) AS place, COUNT(*) AS total, SUM(score >= ? AND is_mine = 0)
+        self.cursor.execute(f'''
+            SELECT {PLACE_SQL} AS place, COUNT(*) AS total, {IMPORTANT_SQL}
             FROM messages
-            WHERE substr(date, 1, 10) = ?
+            WHERE {DAY_SQL} = ?
             GROUP BY place
             ORDER BY total DESC;
         ''', (min_score, day))
         return self.cursor.fetchall()
 
-    def get_important(self, min_score: int, date_from: str, date_to: str, limit: int = 30):
+    def get_important(self, min_score: int, date_from: str, date_to: str, limit: int = config.LIST_LIMIT):
         """
         Важные сообщения за период [date_from, date_to] (даты "ГГГГ-ММ-ДД"), сначала самые важные
         """
-        self.cursor.execute('''
-            SELECT id, date, COALESCE(topic, chat_name), sender, text, score, reasons
+        self.cursor.execute(f'''
+            SELECT id, date, {PLACE_SQL}, sender, text, score, reasons
             FROM messages
-            WHERE is_mine = 0 AND score >= ? AND substr(date, 1, 10) BETWEEN ? AND ?
+            WHERE is_mine = 0 AND score >= ? AND {DAY_SQL} BETWEEN ? AND ?
             ORDER BY score DESC, date DESC
             LIMIT ?;
         ''', (min_score, date_from, date_to, limit))
@@ -242,7 +248,7 @@ class Telegram_DB:
             conditions.append("substr(m.date, 1, 10) = ?")
             params.append(created_on)
         self.cursor.execute(f'''
-            SELECT d.id, d.date, d.kind, COALESCE(m.topic, m.chat_name), m.text
+            SELECT d.id, d.date, d.kind, {PLACE_SQL}, m.text
             FROM deadlines d
             JOIN messages m ON m.id = d.message_ref
             WHERE {" AND ".join(conditions)}
@@ -258,14 +264,14 @@ class Telegram_DB:
         self.conn.commit()
         return self.cursor.rowcount > 0
 
-    def get_unanswered(self, day: str = None, limit: int = 20):
+    def get_unanswered(self, day: str = None, limit: int = config.LIST_LIMIT):
         """
         Вопросы ко мне без ответа (за один день или за всё время)
         """
-        day_condition = "AND substr(date, 1, 10) = ?" if day else ""
+        day_condition = f"AND {DAY_SQL} = ?" if day else ""
         params = (day, limit) if day else (limit,)
         self.cursor.execute(f'''
-            SELECT id, date, COALESCE(topic, chat_name), sender, text, score
+            SELECT id, date, {PLACE_SQL}, sender, text, score
             FROM messages
             WHERE is_question = 1 AND answered = 0 {day_condition}
             ORDER BY date DESC
@@ -273,12 +279,12 @@ class Telegram_DB:
         ''', params)
         return self.cursor.fetchall()
 
-    def search(self, text: str, limit: int = 20):
+    def search(self, text: str, limit: int = config.LIST_LIMIT):
         """
         Поиск по тексту без учёта регистра
         """
-        self.cursor.execute('''
-            SELECT id, date, COALESCE(topic, chat_name), sender, text, score
+        self.cursor.execute(f'''
+            SELECT id, date, {PLACE_SQL}, sender, text, score
             FROM messages
             WHERE py_lower(text) LIKE ?
             ORDER BY date DESC
@@ -286,7 +292,7 @@ class Telegram_DB:
         ''', (f"%{text.lower()}%", limit))
         return self.cursor.fetchall()
 
-    def get_senders(self, min_score: int, limit: int = 20):
+    def get_senders(self, min_score: int, limit: int = config.LIST_LIMIT):
         """
         Самые активные участники: (имя, id, сообщений, важных, админ ли)
         """
@@ -304,8 +310,8 @@ class Telegram_DB:
         """
         Сообщений по дням за days дней до last_day: (день, всего, важных)
         """
-        self.cursor.execute('''
-            SELECT substr(date, 1, 10) AS day, COUNT(*), SUM(score >= ? AND is_mine = 0)
+        self.cursor.execute(f'''
+            SELECT {DAY_SQL} AS day, COUNT(*), {IMPORTANT_SQL}
             FROM messages
             WHERE day > date(?, ?)
             GROUP BY day
@@ -313,12 +319,12 @@ class Telegram_DB:
         ''', (min_score, last_day, f"-{days} days"))
         return self.cursor.fetchall()
 
-    def get_top_places(self, min_score: int, limit: int = 10):
+    def get_top_places(self, min_score: int, limit: int = config.TOP_LIMIT):
         """
         Самые активные темы/чаты: (место, всего, важных)
         """
-        self.cursor.execute('''
-            SELECT COALESCE(topic, chat_name) AS place, COUNT(*) AS total, SUM(score >= ? AND is_mine = 0)
+        self.cursor.execute(f'''
+            SELECT {PLACE_SQL} AS place, COUNT(*) AS total, {IMPORTANT_SQL}
             FROM messages
             GROUP BY place
             ORDER BY total DESC
