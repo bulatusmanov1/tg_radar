@@ -16,7 +16,7 @@ class Telegram_Export_Parser:
 
     def load(self, path: str) -> dict:
         """
-        Чтение файла экспорта. Можно передать путь к папке — внутри будет найден result.json
+        Чтение файла экспорта.
         """
         if os.path.isdir(path):
             path = os.path.join(path, "result.json")

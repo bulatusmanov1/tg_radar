@@ -226,7 +226,8 @@ class TG_Radar:
     def cmd_deadlines(self, args):
         """
         Невыполненные дедлайны и события начиная с сегодняшнего дня.
-        По умолчанию — только из важных сообщений, deadlines all — из всех
+        По умолчанию — только из важных сообщений, deadlines all — из всех.
+        ⚪ — уже прошёл сегодня, 🔴 — меньше URGENT_DAYS дней, 🟡 — меньше SOON_DAYS, 🟢 — позже
         """
         now = datetime.now()
         min_score = None if "all" in args else config.IMPORTANT_SCORE
@@ -236,19 +237,29 @@ class TG_Radar:
             print("Дедлайнов нет")
             return
         for row in rows:
-            days_left = (datetime.strptime(row[1], config.DEADLINE_FORMAT) - now).days
-            mark = "🔴" if days_left < config.URGENT_DAYS else "🟡" if days_left < config.SOON_DAYS else "🟢"
+            deadline_time = datetime.strptime(row[1], config.DEADLINE_FORMAT)
+            days_left = (deadline_time - now).days
+            if deadline_time < now:
+                mark = "⚪"
+            elif days_left < config.URGENT_DAYS:
+                mark = "🔴"
+            elif days_left < config.SOON_DAYS:
+                mark = "🟡"
+            else:
+                mark = "🟢"
             self.print_deadline(row, mark)
         print("Отметить выполненным: done <номер>")
 
     def cmd_done(self, args):
         """
-        Отметить дедлайн выполненным
+        Отметить дедлайн выполненным (вместе с остальными датами из того же сообщения)
         """
         if not args or not args[0].isdigit():
             print("Пример: done 4")
-        elif self.db.mark_deadline_done(int(args[0])):
-            print("Готово ✓")
+            return
+        closed = self.db.mark_deadline_done(int(args[0]))
+        if closed:
+            print(f"Готово ✓ (отмечено дат из этого сообщения: {closed})")
         else:
             print("Нет такого дедлайна")
 

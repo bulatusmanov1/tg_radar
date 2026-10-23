@@ -39,7 +39,7 @@ class Date_Parser:
 
     RE_DEADLINE_WORDS = re.compile(
         r"\b(дедлайн\w*|deadline|due|срок\w*|сдать|сдач\w*|сда[её]м|сда[её]т|загруз\w*|отправ\w*|"
-        r"присла\w*|успе\w*|крайн\w*|не позднее|включительно|дз|домашн\w*|домашк\w*|лаб\w*)\b",
+        r"присла\w*|крайн\w*|не позднее|включительно|дз|домашн\w*|домашк\w*|лаб\w*)\b",
         re.IGNORECASE
     )
     RE_WEAK_DEADLINE = re.compile(r"\bдо\b", re.IGNORECASE)

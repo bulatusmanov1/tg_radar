@@ -256,13 +256,18 @@ class Telegram_DB:
         ''', params)
         return self.cursor.fetchall()
 
-    def mark_deadline_done(self, deadline_id: int) -> bool:
+    def mark_deadline_done(self, deadline_id: int) -> int:
         """
-        Отметить дедлайн выполненным
+        Отметить дедлайн выполненным — вместе со всеми датами из того же сообщения
+        Возвращает:
+            сколько дат отмечено (0, если такого дедлайна нет)
         """
-        self.cursor.execute('UPDATE deadlines SET is_done = 1 WHERE id = ?;', (deadline_id,))
+        self.cursor.execute('''
+            UPDATE deadlines SET is_done = 1
+            WHERE message_ref = (SELECT message_ref FROM deadlines WHERE id = ?);
+        ''', (deadline_id,))
         self.conn.commit()
-        return self.cursor.rowcount > 0
+        return self.cursor.rowcount
 
     def get_unanswered(self, day: str = None, limit: int = config.LIST_LIMIT):
         """
